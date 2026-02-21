@@ -1,0 +1,136 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://brains.local/schemas/brain_core.schema.json",
+  "title": "BD Brain Core Record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "brain",
+    "version_introduced",
+    "topic",
+    "type",
+    "assertion",
+    "confidence",
+    "status",
+    "evidence",
+    "created_at"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "brain": {
+      "type": "string",
+      "minLength": 1
+    },
+    "version_introduced": {
+      "type": "string",
+      "minLength": 1
+    },
+    "topic": {
+      "type": "string",
+      "enum": [
+        "API",
+        "SEO",
+        "Leads",
+        "Templates",
+        "Monetization",
+        "URLs",
+        "Guardrails",
+        "Other"
+      ]
+    },
+    "type": {
+      "type": "string",
+      "enum": [
+        "rule",
+        "fact",
+        "tactic",
+        "warning",
+        "definition"
+      ]
+    },
+    "assertion": {
+      "type": "string",
+      "minLength": 10,
+      "maxLength": 500
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "active",
+        "deprecated",
+        "disputed",
+        "experimental"
+      ]
+    },
+    "evidence": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["source_id", "note"],
+        "properties": {
+          "source_id": { "type": "string" },
+          "note": { "type": "string" }
+        }
+      }
+    },
+    "notes": {
+      "type": "string"
+    },
+    "conflicts_with_ids": {
+      "type": "array",
+      "items": { "type": "string" },
+      "minItems": 1
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "tags": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "type": { "const": "rule" } },
+        "required": ["type"]
+      },
+      "then": {
+        "properties": {
+          "evidence": {
+            "minItems": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "status": { "const": "deprecated" } },
+        "required": ["status"]
+      },
+      "then": {
+        "required": ["notes"]
+      }
+    },
+    {
+      "if": {
+        "properties": { "status": { "const": "disputed" } },
+        "required": ["status"]
+      },
+      "then": {
+        "required": ["conflicts_with_ids"]
+      }
+    }
+  ]
+}
