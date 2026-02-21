@@ -9,13 +9,23 @@ from uuid import uuid4
 import streamlit as st
 
 from adapters.extraction import extract_brain_records
-from adapters.transcription import TranscriptionError, get_transcript_for_source, get_yta_runtime_info
+from adapters.transcription import (
+    TranscriptionError,
+    get_transcript_for_source,
+    get_transcript_from_worker,
+    get_yta_runtime_info,
+)
 from adapters.youtube_discovery import discover_youtube_videos
 from brainpack.exporters import build_pack_zip, write_json, write_jsonl, write_sources_csv
 from brainpack.utils import now_iso, slugify
 from brainpack.validators import validate_pack_manifest, validate_record, validate_run_metadata, validate_source
+from brains.net.proxy_manager import ProxyConfig, ProxyManager
 
 
+
+
+def _bool_env(name: str, default: bool = False) -> bool:
+    return os.getenv(name, str(default)).lower() == "true"
 st.set_page_config(page_title="Brains Ingestion", layout="wide")
 st.title("Brains Ingestion")
 
@@ -28,9 +38,41 @@ use_openai_extraction = st.toggle(
 )
 allow_audio_fallback = st.toggle("Allow audio transcription fallback", value=False)
 
+proxy_enabled = st.checkbox("Use Decodo proxy", value=_bool_env("DECODO_ENABLED", False))
+proxy_sticky = st.checkbox(
+    "Sticky per video",
+    value=os.getenv("DECODO_STICKY_MODE", "per_video") == "per_video",
+    disabled=not proxy_enabled,
+)
+proxy_country = st.text_input("Country (optional)", value=os.getenv("DECODO_COUNTRY", ""), disabled=not proxy_enabled)
+
+worker_url = (os.getenv("BRAINS_WORKER_URL") or "").strip()
+worker_api_key = (os.getenv("BRAINS_WORKER_API_KEY") or "").strip()
+
+proxy_manager = ProxyManager(
+    ProxyConfig(
+        enabled=proxy_enabled,
+        gateway_host=os.getenv("DECODO_GATEWAY_HOST", "gate.decodo.com"),
+        gateway_port=int(os.getenv("DECODO_GATEWAY_PORT", "7000")),
+        user=os.getenv("DECODO_USER"),
+        password=os.getenv("DECODO_PASS"),
+        country=proxy_country.strip() or None,
+        sticky_mode="per_video" if proxy_sticky else "off",
+        timeout_seconds=int(os.getenv("DECODO_TIMEOUT_SECONDS", "30")),
+        max_retries=int(os.getenv("DECODO_MAX_RETRIES", "3")),
+    )
+)
+
 st.caption("Default ingestion is transcript-first and does not download video/audio streams.")
 if allow_audio_fallback:
     st.warning("Audio fallback uses yt-dlp/ffmpeg + OpenAI and can fail on Streamlit Cloud; it is recommended for local runs.")
+if worker_url:
+    st.info(f"Worker routing enabled: {worker_url}")
+
+with st.expander("Proxy diagnostics", expanded=False):
+    st.json(proxy_manager.safe_diagnostics())
+    if st.button("Run proxy IP check"):
+        st.json(proxy_manager.health_check(proxy_session_key="diagnostics"))
 
 if "advanced_logs" not in st.session_state:
     st.session_state.advanced_logs = []
@@ -42,6 +84,9 @@ def _log(video_id: str, message: str) -> None:
 
 if st.button("Generate Brain Pack", type="primary"):
     st.session_state.advanced_logs = []
+    os.environ["DECODO_ENABLED"] = "true" if proxy_enabled else "false"
+    os.environ["DECODO_COUNTRY"] = proxy_country.strip()
+    os.environ["DECODO_STICKY_MODE"] = "per_video" if proxy_sticky else "off"
     runtime_errors: list[str] = []
     per_video_errors: list[str] = []
     validation_errors: list[str] = []
@@ -92,11 +137,28 @@ if st.button("Generate Brain Pack", type="primary"):
         _log(video_key, "Discovery status: queued")
 
         try:
-            transcript = get_transcript_for_source(
-                source,
-                allow_audio_fallback=allow_audio_fallback,
-                openai_api_key_present=openai_api_key_present,
-            )
+            if worker_url and worker_api_key:
+                try:
+                    transcript = get_transcript_from_worker(
+                        source,
+                        worker_url=worker_url,
+                        worker_api_key=worker_api_key,
+                        allow_audio_fallback=allow_audio_fallback,
+                    )
+                    _log(video_key, f"Worker transcript method used: {transcript.get('method')}")
+                except Exception as worker_exc:
+                    _log(video_key, f"Worker failed, falling back local: {worker_exc}")
+                    transcript = get_transcript_for_source(
+                        source,
+                        allow_audio_fallback=allow_audio_fallback,
+                        openai_api_key_present=openai_api_key_present,
+                    )
+            else:
+                transcript = get_transcript_for_source(
+                    source,
+                    allow_audio_fallback=allow_audio_fallback,
+                    openai_api_key_present=openai_api_key_present,
+                )
             transcript["source"] = source
             diagnostics = transcript.get("diagnostics", {})
             video_diagnostics.append({"video_id": video_key, **diagnostics})
@@ -161,6 +223,10 @@ if st.button("Generate Brain Pack", type="primary"):
             "discovery_only": discovery_only,
             "use_openai_extraction": use_openai_extraction,
             "allow_audio_fallback": allow_audio_fallback,
+            "use_decodo_proxy": proxy_enabled,
+            "decodo_sticky_per_video": proxy_sticky,
+            "decodo_country": proxy_country.strip() or None,
+            "worker_url": worker_url or None,
         },
         "errors": runtime_errors,
         "yta_runtime": yta_runtime,

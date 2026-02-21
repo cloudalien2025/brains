@@ -3,7 +3,7 @@
   "$id": "https://brains.local/schemas/run_metadata.schema.json",
   "title": "Run Metadata",
   "type": "object",
-  "additionalProperties": false,
+  "additionalProperties": true,
   "required": [
     "run_id",
     "keyword",
