@@ -1,76 +1,132 @@
 from __future__ import annotations
 
+import json
+import os
 import platform
 from pathlib import Path
 from uuid import uuid4
 
 import streamlit as st
 
-from adapters.extraction import extract_brain_core_records
+from adapters.extraction import extract_brain_records
 from adapters.transcription import transcribe
-from adapters.youtube_discovery import discover_videos
-from brainpack.exporters import write_json, write_jsonl, write_sources_csv
+from adapters.youtube_discovery import discover_youtube_videos
+from brainpack.exporters import build_pack_zip, write_json, write_jsonl, write_sources_csv
 from brainpack.utils import now_iso, slugify
-from brainpack.validators import (
-    validate_pack_manifest,
-    validate_record,
-    validate_run_metadata,
-    validate_source,
-)
+from brainpack.validators import validate_pack_manifest, validate_record, validate_run_metadata, validate_source
 
 
-st.set_page_config(page_title="Brains Ingestion MVP", layout="wide")
-st.title("Brains Ingestion MVP")
+st.set_page_config(page_title="Brains Ingestion", layout="wide")
+st.title("Brains Ingestion")
 
-keyword = st.text_input("Keyword", value="boutique hotels")
-max_videos = st.number_input("Max videos", min_value=1, max_value=100, value=25, step=1)
+keyword = st.text_input("Keyword", value="Brilliant Directories")
+max_videos = st.number_input("Max videos", min_value=1, max_value=50, value=5, step=1)
 discovery_only = st.toggle("Discovery only", value=False)
+use_openai_extraction = st.toggle(
+    "Use OpenAI for extraction (recommended)",
+    value=bool(os.getenv("OPENAI_API_KEY")),
+)
+allow_audio_fallback = st.toggle("Allow audio transcription fallback", value=False)
 
-if "log" not in st.session_state:
-    st.session_state.log = []
+if allow_audio_fallback:
+    st.warning("Audio fallback can require yt-dlp/ffmpeg and may increase latency/cost.")
+
+if "advanced_logs" not in st.session_state:
+    st.session_state.advanced_logs = []
 
 
-def log(message: str) -> None:
-    st.session_state.log.append(message)
+def _log(video_id: str, message: str) -> None:
+    st.session_state.advanced_logs.append({"video": video_id, "message": message})
 
 
 if st.button("Generate Brain Pack", type="primary"):
-    st.session_state.log = []
+    st.session_state.advanced_logs = []
     errors: list[str] = []
     started_at = now_iso()
 
-    videos = discover_videos(keyword=keyword, max_videos=int(max_videos))
-    log(f"Discovered {len(videos)} videos for '{keyword}'.")
+    if not os.getenv("YOUTUBE_API_KEY"):
+        st.error("YOUTUBE_API_KEY is required in real ingestion mode.")
+        st.stop()
+
+    try:
+        videos = discover_youtube_videos(keyword=keyword, max_videos=int(max_videos))
+    except Exception as exc:
+        st.error(f"Discovery failed: {exc}")
+        st.stop()
 
     for src in videos:
-        errors.extend([f"source:{src.get('source_id', 'unknown')} {err}" for err in validate_source(src)])
+        source_errors = validate_source(src)
+        if source_errors:
+            errors.extend([f"source:{src.get('source_id', 'unknown')} {err}" for err in source_errors])
+
+    st.subheader("Discovery results")
+    st.dataframe(videos, use_container_width=True)
+
+    csv_preview = "\n".join(
+        ["source_id,source_type,title,channel,url,published_at,duration_seconds"]
+        + [
+            f"{v['source_id']},{v['source_type']},{v['title']},{v['channel']},{v['url']},{v.get('published_at','')},{v.get('duration_seconds','')}"
+            for v in videos
+        ]
+    )
+    st.download_button("Download Sources.csv", data=csv_preview.encode("utf-8"), file_name="Sources.csv", mime="text/csv")
+
+    if discovery_only:
+        st.info("Discovery only is enabled; ingestion stopped after discovery.")
+        st.stop()
 
     queue = videos[: int(max_videos)]
-    transcripts = []
-    records = []
+    transcripts: list[dict] = []
+    records: list[dict] = []
+    additions_blocks: list[str] = []
 
-    if not discovery_only and not errors:
-        transcripts = [transcribe(item) for item in queue]
-        log(f"Transcribed {len(transcripts)} queued videos.")
-        records = extract_brain_core_records(keyword, transcripts)
-        log(f"Extracted {len(records)} brain_core records.")
-        for rec in records:
-            errors.extend([f"record:{rec.get('id', 'unknown')} {err}" for err in validate_record(rec)])
+    for source in queue:
+        video_key = source.get("source_id", "unknown")
+        _log(video_key, "Discovery status: queued")
+        try:
+            transcript = transcribe(source, allow_audio_fallback=allow_audio_fallback)
+            transcript["source"] = source
+            transcripts.append(transcript)
+            _log(video_key, f"Transcript method used: {transcript.get('method')}")
+        except Exception as exc:
+            errors.append(f"transcription:{video_key} {exc}")
+            _log(video_key, f"Transcript failed: {exc}")
+            continue
+
+        source_records, additions_md = extract_brain_records(
+            brain="BD_Brain",
+            keyword=keyword,
+            source=source,
+            transcript=transcript,
+            use_openai=use_openai_extraction and bool(os.getenv("OPENAI_API_KEY")),
+        )
+        additions_blocks.append(additions_md)
+        _log(video_key, f"Extraction counts: {len(source_records)}")
+
+        for rec in source_records:
+            record_errors = validate_record(rec)
+            if record_errors:
+                errors.extend([f"record:{rec.get('id', 'unknown')} {err}" for err in record_errors])
+        records.extend(source_records)
 
     run_metadata = {
         "run_id": f"run_{uuid4().hex[:8]}",
         "keyword": keyword,
         "started_at": started_at,
         "ended_at": now_iso(),
-        "config": {"max_videos": int(max_videos), "discovery_only": discovery_only},
+        "config": {
+            "max_videos": int(max_videos),
+            "discovery_only": discovery_only,
+            "use_openai_extraction": use_openai_extraction,
+            "allow_audio_fallback": allow_audio_fallback,
+        },
         "errors": errors,
         "env": {
             "python_version": platform.python_version(),
             "platform": platform.platform(),
-            "has_youtube_api_key": False,
+            "has_youtube_api_key": bool(os.getenv("YOUTUBE_API_KEY")),
         },
     }
-
     errors.extend([f"run_metadata {err}" for err in validate_run_metadata(run_metadata)])
 
     pack_slug = slugify(keyword)
@@ -98,34 +154,54 @@ if st.button("Generate Brain Pack", type="primary"):
             "records_extracted": len(records),
         },
     }
+    manifest_errors = validate_pack_manifest(manifest)
+    errors.extend([f"pack_manifest {err}" for err in manifest_errors])
 
-    errors.extend([f"pack_manifest {err}" for err in validate_pack_manifest(manifest)])
+    validation_status = "passed" if not errors else "failed"
+    for source in queue:
+        _log(source.get("source_id", "unknown"), f"Validation status: {validation_status}")
 
     if errors:
-        st.error("Validation failed. No output written.")
+        st.error("Validation failed. Brain Pack was not written.")
         for err in errors:
             st.write(f"- {err}")
-    else:
-        pack_dir.mkdir(parents=True, exist_ok=True)
-        (pack_dir / "Brain_Additions.md").write_text(
-            "# Brain Additions\n\nGenerated by ingestion MVP.\n", encoding="utf-8"
-        )
-        (pack_dir / "Brain_Diff.md").write_text("# Brain Diff\n\nInitial MVP diff.\n", encoding="utf-8")
-        write_jsonl(pack_dir / "Brain_Core.jsonl", records)
-        write_sources_csv(pack_dir / "Sources.csv", queue)
-        write_json(pack_dir / "Run_Metadata.json", run_metadata)
-        write_json(pack_dir / "Pack_Manifest.json", manifest)
-        log(f"Pack written: {pack_dir}")
-        st.success(f"Generated Brain Pack at: {pack_dir}")
+        st.stop()
 
-    with st.expander("Discovery results", expanded=True):
-        st.json(videos)
+    pack_dir.mkdir(parents=True, exist_ok=True)
+    additions_text = "# Brain Additions\n\n" + "\n\n".join(additions_blocks)
+    diff_text = (
+        "# Brain Diff\n\n"
+        f"- Sources: {len(queue)}\n"
+        f"- Records extracted: {len(records)}\n"
+        f"- Keyword: {keyword}\n"
+    )
 
-    with st.expander("Queue", expanded=False):
-        st.json(queue)
+    write_jsonl(pack_dir / "Brain_Core.jsonl", records)
+    write_sources_csv(pack_dir / "Sources.csv", queue)
+    write_json(pack_dir / "Run_Metadata.json", run_metadata)
+    write_json(pack_dir / "Pack_Manifest.json", manifest)
+    write_json(pack_dir / "pack_manifest.json", manifest)
+    (pack_dir / "Brain_Additions.md").write_text(additions_text, encoding="utf-8")
+    (pack_dir / "Brain_Diff.md").write_text(diff_text, encoding="utf-8")
 
-    with st.expander("Run log", expanded=True):
-        st.write("\n".join(st.session_state.log) if st.session_state.log else "No log entries.")
+    pack_files = {
+        "Brain_Additions.md": additions_text,
+        "Brain_Core.jsonl": "\n".join(json.dumps(r, ensure_ascii=False) for r in records) + "\n",
+        "Brain_Diff.md": diff_text,
+        "Sources.csv": (pack_dir / "Sources.csv").read_text(encoding="utf-8"),
+        "Run_Metadata.json": (pack_dir / "Run_Metadata.json").read_text(encoding="utf-8"),
+        "pack_manifest.json": (pack_dir / "pack_manifest.json").read_text(encoding="utf-8"),
+    }
+    zip_bytes = build_pack_zip(pack_files)
 
-    with st.expander("Outputs", expanded=True):
-        st.json(outputs)
+    st.success(f"Generated Brain Pack at: {pack_dir}")
+    st.download_button(
+        "Download Brain Pack (.zip)",
+        data=zip_bytes,
+        file_name=f"{pack_name}.zip",
+        mime="application/zip",
+    )
+
+    with st.expander("Advanced logs", expanded=False):
+        for entry in st.session_state.advanced_logs:
+            st.write(f"[{entry['video']}] {entry['message']}")
