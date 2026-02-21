@@ -84,6 +84,7 @@ if st.button("Generate Brain Pack", type="primary"):
     additions_blocks: list[str] = []
     successful_sources = 0
     failed_sources = 0
+    video_diagnostics: list[dict] = []
 
     for source in queue:
         video_key = source.get("source_id", "unknown")
@@ -96,11 +97,16 @@ if st.button("Generate Brain Pack", type="primary"):
                 openai_api_key_present=openai_api_key_present,
             )
             transcript["source"] = source
+            diagnostics = transcript.get("diagnostics", {})
+            video_diagnostics.append({"video_id": video_key, **diagnostics})
             _log(video_key, f"Transcript method used: {transcript.get('method')}")
+            _log(video_key, f"Transcript diagnostics: {json.dumps(diagnostics, ensure_ascii=False)}")
         except TranscriptionError as exc:
             failed_sources += 1
+            diagnostics = getattr(exc, "diagnostics", {}) or {}
+            video_diagnostics.append({"video_id": video_key, **diagnostics})
             if exc.code == "transcript_unavailable_disabled":
-                label = "transcript_unavailable (audio fallback disabled)"
+                label = "transcript_unavailable_yta; transcript_unavailable_timedtext (audio fallback disabled)"
             elif exc.code in {"audio_fallback_failed", "audio_fallback_requires_openai_key"}:
                 label = str(exc)
             else:
@@ -109,6 +115,7 @@ if st.button("Generate Brain Pack", type="primary"):
             runtime_errors.append(err)
             per_video_errors.append(f"{video_key}: {label}")
             _log(video_key, f"Transcript failed: {label}")
+            _log(video_key, f"Transcript diagnostics: {json.dumps(diagnostics, ensure_ascii=False)}")
             continue
         except Exception as exc:
             failed_sources += 1
@@ -155,6 +162,7 @@ if st.button("Generate Brain Pack", type="primary"):
             "allow_audio_fallback": allow_audio_fallback,
         },
         "errors": runtime_errors,
+        "video_diagnostics": video_diagnostics,
         "env": {
             "python_version": platform.python_version(),
             "platform": platform.platform(),
@@ -199,6 +207,9 @@ if st.button("Generate Brain Pack", type="primary"):
         st.subheader("Per-video errors")
         for err in per_video_errors:
             st.write(f"- {err}")
+
+    with st.expander("Transcript diagnostics", expanded=False):
+        st.json(video_diagnostics)
 
     if validation_errors:
         st.error("Validation failed. Brain Pack was not written.")

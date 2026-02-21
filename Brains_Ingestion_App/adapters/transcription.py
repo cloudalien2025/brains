@@ -4,8 +4,8 @@ import os
 import tempfile
 from html import unescape
 from pathlib import Path
+from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.request import Request, urlopen
-from urllib.parse import parse_qs, urlparse
 import xml.etree.ElementTree as ET
 
 from youtube_transcript_api import YouTubeTranscriptApi
@@ -29,11 +29,20 @@ TIMEDTEXT_HEADERS = {
 
 
 class TranscriptionError(RuntimeError):
-    def __init__(self, message: str, *, video_id: str, url: str, code: str = "transcription_error"):
+    def __init__(
+        self,
+        message: str,
+        *,
+        video_id: str,
+        url: str,
+        code: str = "transcription_error",
+        diagnostics: dict | None = None,
+    ):
         super().__init__(message)
         self.video_id = video_id
         self.url = url
         self.code = code
+        self.diagnostics = diagnostics or {}
 
 
 class TranscriptUnavailableError(TranscriptionError):
@@ -117,14 +126,14 @@ def _parse_timedtext_segments(body: str) -> list[dict]:
     if not trimmed:
         return []
 
-    if "<text" in trimmed:
+    if "<text" in trimmed or "<p" in trimmed:
         try:
             root = ET.fromstring(trimmed)
         except ET.ParseError:
             return []
 
         segments: list[dict] = []
-        for node in root.findall(".//text"):
+        for node in root.findall(".//text") + root.findall(".//p"):
             raw_text = "".join(node.itertext()) if node is not None else ""
             text = unescape(raw_text).strip()
             if not text:
@@ -175,6 +184,131 @@ def fetch_timedtext(video_id: str, lang: str = "en") -> dict | None:
                 "language": language,
                 "segments": segments,
             }
+
+    return None
+
+
+def _timedtext_list_tracks(video_id: str) -> list[dict]:
+    request = Request(
+        f"https://www.youtube.com/api/timedtext?type=list&v={video_id}",
+        headers={
+            **TIMEDTEXT_HEADERS,
+            "Accept": "text/plain,text/vtt,application/xml,text/xml,*/*",
+        },
+    )
+    try:
+        with urlopen(request, timeout=10) as response:
+            if response.status != 200:
+                return []
+            body = response.read().decode("utf-8", errors="replace")
+    except Exception:
+        return []
+
+    trimmed = body.strip()
+    if not trimmed or "<track" not in trimmed:
+        return []
+
+    try:
+        root = ET.fromstring(trimmed)
+    except ET.ParseError:
+        return []
+
+    tracks: list[dict] = []
+    for node in root.findall(".//track"):
+        kind = (node.attrib.get("kind") or "").strip()
+        tracks.append(
+            {
+                "lang_code": (node.attrib.get("lang_code") or "").strip(),
+                "lang_translated": (node.attrib.get("lang_translated") or "").strip() or None,
+                "name": (node.attrib.get("name") or "").strip(),
+                "kind": kind or None,
+                "vss_id": (node.attrib.get("vss_id") or "").strip() or None,
+                "is_auto": kind == "asr",
+            }
+        )
+    return [track for track in tracks if track["lang_code"]]
+
+
+def _pick_best_track(tracks: list[dict]) -> dict | None:
+    if not tracks:
+        return None
+
+    english_codes = {"en", "en-us", "en-gb"}
+
+    def _is_english(track: dict) -> bool:
+        return (track.get("lang_code") or "").lower() in english_codes
+
+    manual_english = [t for t in tracks if _is_english(t) and t.get("kind") != "asr"]
+    if manual_english:
+        return manual_english[0]
+
+    auto_english = [t for t in tracks if _is_english(t) and t.get("kind") == "asr"]
+    if auto_english:
+        return auto_english[0]
+
+    any_manual = [t for t in tracks if t.get("kind") != "asr"]
+    if any_manual:
+        return any_manual[0]
+
+    any_auto = [t for t in tracks if t.get("kind") == "asr"]
+    return any_auto[0] if any_auto else None
+
+
+def _timedtext_fetch_track(video_id: str, track: dict) -> dict | None:
+    params = {
+        "v": video_id,
+        "lang": track.get("lang_code") or "",
+    }
+    if track.get("kind") == "asr":
+        params["kind"] = "asr"
+    if track.get("name"):
+        params["name"] = track["name"]
+
+    fetch_attempts = [
+        ("vtt", {**params, "fmt": "vtt"}),
+        ("srv3", {**params, "fmt": "srv3"}),
+        ("xml", params),
+    ]
+
+    for fmt, attempt_params in fetch_attempts:
+        query = urlencode(attempt_params)
+        timedtext_url = f"https://www.youtube.com/api/timedtext?{query}"
+        request = Request(
+            timedtext_url,
+            headers={
+                **TIMEDTEXT_HEADERS,
+                "Accept": "text/plain,text/vtt,application/xml,text/xml,*/*",
+            },
+        )
+
+        try:
+            with urlopen(request, timeout=10) as response:
+                status = response.status
+                body = response.read().decode("utf-8", errors="replace")
+        except Exception:
+            continue
+
+        if status != 200 or len(body) <= 50:
+            continue
+
+        lowered = body.lower()
+        if "webvtt" not in lowered and "<text" not in lowered and "<p" not in lowered:
+            continue
+
+        segments = _parse_timedtext_segments(body)
+        if not segments:
+            continue
+
+        return {
+            "url": f"https://www.youtube.com/watch?v={video_id}",
+            "video_id": video_id,
+            "method": "youtube_timedtext",
+            "language": track.get("lang_code") or None,
+            "segments": segments,
+            "full_text": _full_text(segments),
+            "timedtext_fetch_format": fmt,
+            "timedtext_fetch_status": status,
+        }
 
     return None
 
@@ -241,6 +375,14 @@ def get_transcript_for_source(source: dict, allow_audio_fallback: bool, openai_a
             code="invalid_video_url",
         )
 
+    diagnostics = {
+        "yta_error": None,
+        "timedtext_tracks_found": 0,
+        "timedtext_best_track": None,
+        "timedtext_fetch_status": None,
+        "transcript_method_final": None,
+    }
+
     try:
         fetched, language = _fetch_youtube_transcript(video_id)
         segments = _normalize_segments(fetched)
@@ -252,7 +394,7 @@ def get_transcript_for_source(source: dict, allow_audio_fallback: bool, openai_a
                 code="empty_transcript",
             )
 
-        return {
+        result = {
             "url": source["url"],
             "video_id": video_id,
             "method": "youtube_transcript",
@@ -260,12 +402,39 @@ def get_transcript_for_source(source: dict, allow_audio_fallback: bool, openai_a
             "segments": segments,
             "full_text": _full_text(segments),
         }
-    except (NoTranscriptFound, TranscriptsDisabled, VideoUnavailable, TooManyRequests) as exc:
-        timedtext = fetch_timedtext(video_id, "en")
-        if timedtext:
-            timedtext["url"] = source["url"]
-            timedtext["full_text"] = _full_text(timedtext["segments"])
-            return timedtext
+        diagnostics["transcript_method_final"] = "youtube_transcript"
+        result["diagnostics"] = diagnostics
+        return result
+    except Exception as exc:
+        diagnostics["yta_error"] = str(exc)
+
+    try:
+        tracks = _timedtext_list_tracks(video_id)
+        diagnostics["timedtext_tracks_found"] = len(tracks)
+        best_track = _pick_best_track(tracks)
+        diagnostics["timedtext_best_track"] = (
+            {
+                "lang_code": best_track.get("lang_code"),
+                "kind": best_track.get("kind"),
+                "name": best_track.get("name"),
+            }
+            if best_track
+            else None
+        )
+        if best_track:
+            timedtext = _timedtext_fetch_track(video_id, best_track)
+            diagnostics["timedtext_fetch_status"] = (
+                timedtext.get("timedtext_fetch_status") if timedtext else "empty"
+            )
+            if timedtext and timedtext.get("segments"):
+                timedtext["url"] = source["url"]
+                diagnostics["transcript_method_final"] = "youtube_timedtext"
+                timedtext["diagnostics"] = diagnostics
+                return timedtext
+        else:
+            diagnostics["timedtext_fetch_status"] = "no_track"
+    except Exception as exc:
+        diagnostics["timedtext_fetch_status"] = f"error: {exc}"
 
         if not allow_audio_fallback:
             raise TranscriptUnavailableError(
@@ -273,7 +442,8 @@ def get_transcript_for_source(source: dict, allow_audio_fallback: bool, openai_a
                 video_id=video_id,
                 url=source["url"],
                 code="transcript_unavailable_disabled",
-            ) from exc
+                diagnostics=diagnostics,
+            )
 
         if not openai_api_key_present:
             raise TranscriptionError(
@@ -281,18 +451,53 @@ def get_transcript_for_source(source: dict, allow_audio_fallback: bool, openai_a
                 video_id=video_id,
                 url=source["url"],
                 code="audio_fallback_requires_openai_key",
-            ) from exc
+                diagnostics=diagnostics,
+            )
 
         try:
-            return _transcribe_with_openai_audio(source)
+            audio_result = _transcribe_with_openai_audio(source)
+            diagnostics["transcript_method_final"] = "audio_fallback"
+            audio_result["diagnostics"] = diagnostics
+            return audio_result
         except Exception as audio_exc:
             raise TranscriptionError(
                 f"transcript_unavailable_yta; transcript_unavailable_timedtext; audio_fallback_failed: {audio_exc}",
                 video_id=video_id,
                 url=source["url"],
                 code="audio_fallback_failed",
+                diagnostics=diagnostics,
             ) from audio_exc
     except TranscriptionError:
         raise
-    except Exception as exc:
-        raise TranscriptionError(str(exc), video_id=video_id, url=source["url"], code="transcription_error") from exc
+
+    if not allow_audio_fallback:
+        raise TranscriptUnavailableError(
+            "transcript_unavailable_yta; transcript_unavailable_timedtext; No transcript available (audio fallback disabled).",
+            video_id=video_id,
+            url=source["url"],
+            code="transcript_unavailable_disabled",
+            diagnostics=diagnostics,
+        )
+
+    if not openai_api_key_present:
+        raise TranscriptionError(
+            "transcript_unavailable_yta; transcript_unavailable_timedtext; Audio fallback requires OPENAI_API_KEY.",
+            video_id=video_id,
+            url=source["url"],
+            code="audio_fallback_requires_openai_key",
+            diagnostics=diagnostics,
+        )
+
+    try:
+        audio_result = _transcribe_with_openai_audio(source)
+        diagnostics["transcript_method_final"] = "audio_fallback"
+        audio_result["diagnostics"] = diagnostics
+        return audio_result
+    except Exception as audio_exc:
+        raise TranscriptionError(
+            f"transcript_unavailable_yta; transcript_unavailable_timedtext; audio_fallback_failed: {audio_exc}",
+            video_id=video_id,
+            url=source["url"],
+            code="audio_fallback_failed",
+            diagnostics=diagnostics,
+        ) from audio_exc
