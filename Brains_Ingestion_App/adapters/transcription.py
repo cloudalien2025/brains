@@ -610,10 +610,11 @@ def get_transcript_from_worker(
 ) -> dict:
     response = requests.post(
         f"{worker_url.rstrip('/')}/transcript",
-        headers={"X-Brains-Worker-Key": worker_api_key, "Content-Type": "application/json"},
+        headers={"X-Api-Key": worker_api_key, "Content-Type": "application/json"},
         json={
-            "video_id": _video_id_from_url(source["url"]),
-            "prefer_lang": prefer_lang or ["en"],
+            "source_id": f"yt:{_video_id_from_url(source['url'])}",
+            "url": source["url"],
+            "language": (prefer_lang or ["en"])[0] if (prefer_lang or ["en"]) else None,
             "allow_audio_fallback": allow_audio_fallback,
         },
         timeout=60,
