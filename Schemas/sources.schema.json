@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://brains.local/schemas/sources.schema.json",
+  "title": "Source Record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["source_id", "source_type", "title", "channel", "url"],
+  "properties": {
+    "source_id": { "type": "string", "minLength": 1 },
+    "source_type": { "type": "string", "const": "youtube" },
+    "title": { "type": "string", "minLength": 1 },
+    "channel": { "type": "string", "minLength": 1 },
+    "url": { "type": "string", "format": "uri" },
+    "published_at": { "type": "string", "format": "date-time" },
+    "duration_seconds": { "type": "integer", "minimum": 0 }
+  }
+}

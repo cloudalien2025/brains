@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://brains.local/schemas/run_metadata.schema.json",
+  "title": "Run Metadata",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["run_id", "keyword", "started_at", "ended_at", "config", "errors", "env"],
+  "properties": {
+    "run_id": { "type": "string", "minLength": 1 },
+    "keyword": { "type": "string", "minLength": 1 },
+    "started_at": { "type": "string", "format": "date-time" },
+    "ended_at": { "type": "string", "format": "date-time" },
+    "config": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "errors": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "env": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "python_version": { "type": "string" },
+        "platform": { "type": "string" },
+        "has_youtube_api_key": { "type": "boolean" }
+      }
+    }
+  }
+}

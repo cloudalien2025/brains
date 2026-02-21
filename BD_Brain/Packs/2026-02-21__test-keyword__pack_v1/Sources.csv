@@ -1,0 +1,6 @@
+source_id,source_type,title,channel,url,published_at,duration_seconds
+yt_001,youtube,Test Keyword Strategy Breakdown #1,Mocked Channel,https://youtube.com/watch?v=mock001,2026-02-21T16:03:04.654913+00:00,600
+yt_002,youtube,Test Keyword Strategy Breakdown #2,Mocked Channel,https://youtube.com/watch?v=mock002,2026-02-20T16:03:04.654913+00:00,645
+yt_003,youtube,Test Keyword Strategy Breakdown #3,Mocked Channel,https://youtube.com/watch?v=mock003,2026-02-19T16:03:04.654913+00:00,690
+yt_004,youtube,Test Keyword Strategy Breakdown #4,Mocked Channel,https://youtube.com/watch?v=mock004,2026-02-18T16:03:04.654913+00:00,735
+yt_005,youtube,Test Keyword Strategy Breakdown #5,Mocked Channel,https://youtube.com/watch?v=mock005,2026-02-17T16:03:04.654913+00:00,780

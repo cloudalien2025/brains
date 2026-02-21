@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://brains.local/schemas/brain_pack.schema.json",
+  "title": "Brain Pack Manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "pack_id",
+    "brain",
+    "keyword",
+    "created_at",
+    "sources",
+    "outputs",
+    "stats"
+  ],
+  "properties": {
+    "pack_id": { "type": "string", "minLength": 1 },
+    "brain": { "type": "string", "minLength": 1 },
+    "keyword": { "type": "string", "minLength": 1 },
+    "created_at": { "type": "string", "format": "date-time" },
+    "sources": {
+      "type": "array",
+      "items": { "$ref": "sources.schema.json" }
+    },
+    "outputs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "Brain_Additions.md",
+        "Brain_Core.jsonl",
+        "Brain_Diff.md",
+        "Sources.csv",
+        "Run_Metadata.json"
+      ],
+      "properties": {
+        "Brain_Additions.md": { "type": "string" },
+        "Brain_Core.jsonl": { "type": "string" },
+        "Brain_Diff.md": { "type": "string" },
+        "Sources.csv": { "type": "string" },
+        "Run_Metadata.json": { "type": "string" }
+      }
+    },
+    "stats": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["videos_discovered", "videos_queued", "records_extracted"],
+      "properties": {
+        "videos_discovered": { "type": "integer", "minimum": 0 },
+        "videos_queued": { "type": "integer", "minimum": 0 },
+        "records_extracted": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}
