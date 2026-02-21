@@ -6,7 +6,21 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from youtube_transcript_api import YouTubeTranscriptApi
-from youtube_transcript_api._errors import NoTranscriptFound, TranscriptsDisabled
+from youtube_transcript_api import _errors as transcript_errors
+
+
+TranscriptsDisabled = getattr(transcript_errors, "TranscriptsDisabled", Exception)
+NoTranscriptFound = getattr(transcript_errors, "NoTranscriptFound", Exception)
+VideoUnavailable = getattr(transcript_errors, "VideoUnavailable", Exception)
+TooManyRequests = getattr(transcript_errors, "TooManyRequests", Exception)
+
+
+class TranscriptionError(RuntimeError):
+    def __init__(self, message: str, *, video_id: str, url: str, code: str = "transcription_error"):
+        super().__init__(message)
+        self.video_id = video_id
+        self.url = url
+        self.code = code
 
 
 def _video_id_from_url(url: str) -> str:
@@ -21,12 +35,47 @@ def _normalize_segments(items: list[dict]) -> list[dict]:
     for item in items:
         segments.append(
             {
-                "start": float(item.get("start", 0.0)),
-                "duration": float(item.get("duration", 0.0)),
+                "start": float(item["start"]) if item.get("start") is not None else None,
+                "duration": float(item["duration"]) if item.get("duration") is not None else None,
                 "text": (item.get("text") or "").strip(),
             }
         )
     return [s for s in segments if s["text"]]
+
+
+def _fetch_with_transcript_list(video_id: str) -> tuple[list[dict], str | None]:
+    transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+    try:
+        transcript = transcript_list.find_transcript(["en"])
+    except NoTranscriptFound:
+        transcript = next(iter(transcript_list), None)
+        if transcript is None:
+            raise
+    fetched = transcript.fetch()
+    language = getattr(transcript, "language_code", None)
+    return fetched, language
+
+
+def _fetch_with_get_transcript(video_id: str) -> tuple[list[dict], str | None]:
+    last_error: Exception | None = None
+    for languages in (["en"], ["en-US", "en-GB"], None):
+        kwargs = {} if languages is None else {"languages": languages}
+        try:
+            fetched = YouTubeTranscriptApi.get_transcript(video_id, **kwargs)
+            language = languages[0] if languages else None
+            return fetched, language
+        except TypeError:
+            if languages is not None:
+                continue
+            raise
+        except NoTranscriptFound as exc:
+            last_error = exc
+            if languages is None:
+                raise
+            continue
+    if last_error:
+        raise last_error
+    raise RuntimeError("Unable to fetch transcript with get_transcript")
 
 
 def _full_text(segments: list[dict]) -> str:
@@ -91,29 +140,38 @@ def transcribe_youtube_source(source: dict, allow_audio_fallback: bool = False) 
         raise RuntimeError(f"Unable to extract YouTube video id from URL: {source['url']}")
 
     try:
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-        try:
-            transcript = transcript_list.find_transcript(["en"])
-        except NoTranscriptFound:
-            transcript = transcript_list.find_transcript([t.language_code for t in transcript_list])
-        fetched = transcript.fetch()
+        if hasattr(YouTubeTranscriptApi, "list_transcripts"):
+            fetched, language = _fetch_with_transcript_list(video_id)
+        else:
+            fetched, language = _fetch_with_get_transcript(video_id)
+
         segments = _normalize_segments(fetched)
+        if not segments:
+            raise TranscriptionError(
+                "Transcript returned no usable segments.",
+                video_id=video_id,
+                url=source["url"],
+                code="empty_transcript",
+            )
+
         return {
             "url": source["url"],
             "video_id": video_id,
             "method": "youtube_transcript",
-            "language": transcript.language_code,
+            "language": language,
             "segments": segments,
             "full_text": _full_text(segments),
         }
-    except (NoTranscriptFound, TranscriptsDisabled):
+    except (NoTranscriptFound, TranscriptsDisabled, VideoUnavailable, TooManyRequests) as exc:
         if allow_audio_fallback and os.getenv("OPENAI_API_KEY"):
             return _transcribe_with_openai_audio(source)
+        raise TranscriptionError(str(exc), video_id=video_id, url=source["url"], code=exc.__class__.__name__) from exc
+    except TranscriptionError:
         raise
-    except Exception:
+    except Exception as exc:
         if allow_audio_fallback and os.getenv("OPENAI_API_KEY"):
             return _transcribe_with_openai_audio(source)
-        raise
+        raise TranscriptionError(str(exc), video_id=video_id, url=source["url"]) from exc
 
 
 def transcribe(source: dict, allow_audio_fallback: bool = False) -> dict:
