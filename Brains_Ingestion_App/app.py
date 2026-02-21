@@ -6,6 +6,7 @@ import platform
 from pathlib import Path
 from uuid import uuid4
 
+import requests
 import streamlit as st
 
 from adapters.extraction import extract_brain_records
@@ -49,6 +50,14 @@ proxy_country = st.text_input("Country (optional)", value=os.getenv("DECODO_COUN
 worker_url = (os.getenv("BRAINS_WORKER_URL") or "").strip()
 worker_api_key = (os.getenv("BRAINS_WORKER_API_KEY") or "").strip()
 
+st.subheader("Worker Status")
+if worker_url and worker_api_key:
+    st.success("Worker ACTIVE (URL + API key present)")
+elif worker_url and not worker_api_key:
+    st.error("Worker URL set but API key missing — running locally")
+else:
+    st.warning("Worker disabled — running locally")
+
 proxy_manager = ProxyManager(
     ProxyConfig(
         enabled=proxy_enabled,
@@ -72,7 +81,18 @@ if worker_url:
 with st.expander("Proxy diagnostics", expanded=False):
     st.json(proxy_manager.safe_diagnostics())
     if st.button("Run proxy IP check"):
-        st.json(proxy_manager.health_check(proxy_session_key="diagnostics"))
+        if worker_url and worker_api_key:
+            try:
+                response = requests.get(
+                    f"{worker_url}/proxy/health",
+                    headers={"X-Api-Key": worker_api_key},
+                    timeout=15,
+                )
+                st.json(response.json())
+            except Exception as exc:
+                st.error(f"Worker proxy check failed: {exc}")
+        else:
+            st.warning("Worker not configured — cannot test proxy.")
 
 if "advanced_logs" not in st.session_state:
     st.session_state.advanced_logs = []
@@ -137,22 +157,16 @@ if st.button("Generate Brain Pack", type="primary"):
         _log(video_key, "Discovery status: queued")
 
         try:
-            if worker_url and worker_api_key:
-                try:
-                    transcript = get_transcript_from_worker(
-                        source,
-                        worker_url=worker_url,
-                        worker_api_key=worker_api_key,
-                        allow_audio_fallback=allow_audio_fallback,
-                    )
-                    _log(video_key, f"Worker transcript method used: {transcript.get('method')}")
-                except Exception as worker_exc:
-                    _log(video_key, f"Worker failed, falling back local: {worker_exc}")
-                    transcript = get_transcript_for_source(
-                        source,
-                        allow_audio_fallback=allow_audio_fallback,
-                        openai_api_key_present=openai_api_key_present,
-                    )
+            if worker_url:
+                if not worker_api_key:
+                    raise RuntimeError("BRAINS_WORKER_API_KEY missing — refusing local transcript execution")
+                transcript = get_transcript_from_worker(
+                    source,
+                    worker_url=worker_url,
+                    worker_api_key=worker_api_key,
+                    allow_audio_fallback=allow_audio_fallback,
+                )
+                _log(video_key, f"Worker transcript method used: {transcript.get('method')}")
             else:
                 transcript = get_transcript_for_source(
                     source,
