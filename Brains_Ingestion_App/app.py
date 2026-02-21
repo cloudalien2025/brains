@@ -9,7 +9,7 @@ from uuid import uuid4
 import streamlit as st
 
 from adapters.extraction import extract_brain_records
-from adapters.transcription import TranscriptionError, get_transcript_for_source
+from adapters.transcription import TranscriptionError, get_transcript_for_source, get_yta_runtime_info
 from adapters.youtube_discovery import discover_youtube_videos
 from brainpack.exporters import build_pack_zip, write_json, write_jsonl, write_sources_csv
 from brainpack.utils import now_iso, slugify
@@ -47,6 +47,7 @@ if st.button("Generate Brain Pack", type="primary"):
     validation_errors: list[str] = []
     started_at = now_iso()
     openai_api_key_present = bool(os.getenv("OPENAI_API_KEY"))
+    yta_runtime = get_yta_runtime_info()
 
     if not os.getenv("YOUTUBE_API_KEY"):
         st.error("YOUTUBE_API_KEY is required in real ingestion mode.")
@@ -162,6 +163,7 @@ if st.button("Generate Brain Pack", type="primary"):
             "allow_audio_fallback": allow_audio_fallback,
         },
         "errors": runtime_errors,
+        "yta_runtime": yta_runtime,
         "video_diagnostics": video_diagnostics,
         "env": {
             "python_version": platform.python_version(),
@@ -209,7 +211,7 @@ if st.button("Generate Brain Pack", type="primary"):
             st.write(f"- {err}")
 
     with st.expander("Transcript diagnostics", expanded=False):
-        st.json(video_diagnostics)
+        st.json({"yta_runtime": yta_runtime, "video_diagnostics": video_diagnostics})
 
     if validation_errors:
         st.error("Validation failed. Brain Pack was not written.")

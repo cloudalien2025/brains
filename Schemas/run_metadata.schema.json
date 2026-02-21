@@ -4,27 +4,66 @@
   "title": "Run Metadata",
   "type": "object",
   "additionalProperties": false,
-  "required": ["run_id", "keyword", "started_at", "ended_at", "config", "errors", "env"],
+  "required": [
+    "run_id",
+    "keyword",
+    "started_at",
+    "ended_at",
+    "config",
+    "errors",
+    "env"
+  ],
   "properties": {
-    "run_id": { "type": "string", "minLength": 1 },
-    "keyword": { "type": "string", "minLength": 1 },
-    "started_at": { "type": "string", "format": "date-time" },
-    "ended_at": { "type": "string", "format": "date-time" },
+    "run_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "keyword": {
+      "type": "string",
+      "minLength": 1
+    },
+    "started_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "ended_at": {
+      "type": "string",
+      "format": "date-time"
+    },
     "config": {
       "type": "object",
       "additionalProperties": true
     },
     "errors": {
       "type": "array",
-      "items": { "type": "string" }
+      "items": {
+        "type": "string"
+      }
     },
     "env": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "python_version": { "type": "string" },
-        "platform": { "type": "string" },
-        "has_youtube_api_key": { "type": "boolean" }
+        "python_version": {
+          "type": "string"
+        },
+        "platform": {
+          "type": "string"
+        },
+        "has_youtube_api_key": {
+          "type": "boolean"
+        }
+      }
+    },
+    "yta_runtime": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "video_diagnostics": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true
       }
     }
   }

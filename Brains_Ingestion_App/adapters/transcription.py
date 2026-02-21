@@ -8,6 +8,7 @@ from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.request import Request, urlopen
 import xml.etree.ElementTree as ET
 
+import youtube_transcript_api as yta
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api import _errors as transcript_errors
 
@@ -16,6 +17,21 @@ TranscriptsDisabled = getattr(transcript_errors, "TranscriptsDisabled", Exceptio
 NoTranscriptFound = getattr(transcript_errors, "NoTranscriptFound", Exception)
 VideoUnavailable = getattr(transcript_errors, "VideoUnavailable", Exception)
 TooManyRequests = getattr(transcript_errors, "TooManyRequests", Exception)
+
+
+def _yta_runtime_info() -> dict:
+    return {
+        "yta_module_file": getattr(yta, "__file__", getattr(yta, "file", None)),
+        "yta_version": getattr(yta, "__version__", getattr(yta, "version", None)),
+        "has_get_transcript": hasattr(YouTubeTranscriptApi, "get_transcript"),
+        "has_list_transcripts": hasattr(YouTubeTranscriptApi, "list_transcripts"),
+        "has_fetch": hasattr(YouTubeTranscriptApi, "fetch"),
+        "has_list": hasattr(YouTubeTranscriptApi, "list"),
+    }
+
+
+def get_yta_runtime_info() -> dict:
+    return _yta_runtime_info()
 
 
 TIMEDTEXT_HEADERS = {
@@ -70,11 +86,78 @@ def _normalize_segments(items: list[dict]) -> list[dict]:
 
 
 def _fetch_youtube_transcript(video_id: str) -> tuple[list[dict], str | None]:
-    try:
-        return YouTubeTranscriptApi.get_transcript(video_id, languages=["en"]), "en"
-    except Exception:
-        fetched = YouTubeTranscriptApi.get_transcript(video_id)
-        return fetched, None
+    if hasattr(YouTubeTranscriptApi, "get_transcript"):
+        try:
+            return YouTubeTranscriptApi.get_transcript(video_id, languages=["en"]), "en"
+        except Exception:
+            fetched = YouTubeTranscriptApi.get_transcript(video_id)
+            return fetched, None
+
+    if hasattr(YouTubeTranscriptApi, "list_transcripts"):
+        transcripts = YouTubeTranscriptApi.list_transcripts(video_id)
+        selected = None
+        try:
+            selected = transcripts.find_manually_created_transcript(["en", "en-US", "en-GB"])
+        except Exception:
+            selected = None
+        if selected is None:
+            try:
+                selected = transcripts.find_generated_transcript(["en", "en-US", "en-GB"])
+            except Exception:
+                selected = None
+        if selected is None:
+            for transcript in transcripts:
+                selected = transcript
+                break
+        if selected is None:
+            raise NoTranscriptFound("No transcripts available from list_transcripts().")
+        fetched = selected.fetch()
+        language = getattr(selected, "language_code", None)
+        return fetched, language
+
+    if hasattr(YouTubeTranscriptApi, "fetch"):
+        api = YouTubeTranscriptApi()
+        try:
+            return list(api.fetch(video_id, languages=["en", "en-US", "en-GB"])), "en"
+        except Exception:
+            fetched = list(api.fetch(video_id))
+            return fetched, None
+
+    if hasattr(YouTubeTranscriptApi, "list"):
+        api = YouTubeTranscriptApi()
+        transcripts = api.list(video_id)
+        selected = None
+        try:
+            selected = transcripts.find_manually_created_transcript(["en", "en-US", "en-GB"])
+        except Exception:
+            selected = None
+        if selected is None:
+            try:
+                selected = transcripts.find_generated_transcript(["en", "en-US", "en-GB"])
+            except Exception:
+                selected = None
+        if selected is None:
+            try:
+                selected = transcripts.find_transcript(["en", "en-US", "en-GB"])
+            except Exception:
+                selected = None
+        if selected is None:
+            for transcript in transcripts:
+                selected = transcript
+                break
+        if selected is None:
+            raise NoTranscriptFound("No transcripts available from list().")
+        fetched = list(selected.fetch())
+        language = getattr(selected, "language_code", None)
+        return fetched, language
+
+    raise TranscriptionError(
+        "youtube-transcript-api missing expected methods (import/version issue)",
+        video_id=video_id,
+        url=f"https://www.youtube.com/watch?v={video_id}",
+        code="yta_missing_methods",
+        diagnostics={"yta_runtime": _yta_runtime_info()},
+    )
 
 
 def _full_text(segments: list[dict]) -> str:
@@ -188,7 +271,7 @@ def fetch_timedtext(video_id: str, lang: str = "en") -> dict | None:
     return None
 
 
-def _timedtext_list_tracks(video_id: str) -> list[dict]:
+def _timedtext_list_tracks(video_id: str) -> tuple[list[dict], dict]:
     request = Request(
         f"https://www.youtube.com/api/timedtext?type=list&v={video_id}",
         headers={
@@ -196,22 +279,33 @@ def _timedtext_list_tracks(video_id: str) -> list[dict]:
             "Accept": "text/plain,text/vtt,application/xml,text/xml,*/*",
         },
     )
+    diagnostics = {
+        "timedtext_list_http_status": None,
+        "timedtext_list_body_len": None,
+        "timedtext_list_body_head": None,
+    }
     try:
         with urlopen(request, timeout=10) as response:
-            if response.status != 200:
-                return []
+            diagnostics["timedtext_list_http_status"] = response.status
             body = response.read().decode("utf-8", errors="replace")
-    except Exception:
-        return []
+    except Exception as exc:
+        diagnostics["timedtext_list_http_status"] = f"error: {exc}"
+        return [], diagnostics
+
+    diagnostics["timedtext_list_body_len"] = len(body)
+    diagnostics["timedtext_list_body_head"] = body[:200]
+
+    if diagnostics["timedtext_list_http_status"] != 200:
+        return [], diagnostics
 
     trimmed = body.strip()
     if not trimmed or "<track" not in trimmed:
-        return []
+        return [], diagnostics
 
     try:
         root = ET.fromstring(trimmed)
     except ET.ParseError:
-        return []
+        return [], diagnostics
 
     tracks: list[dict] = []
     for node in root.findall(".//track"):
@@ -226,7 +320,7 @@ def _timedtext_list_tracks(video_id: str) -> list[dict]:
                 "is_auto": kind == "asr",
             }
         )
-    return [track for track in tracks if track["lang_code"]]
+    return [track for track in tracks if track["lang_code"]], diagnostics
 
 
 def _pick_best_track(tracks: list[dict]) -> dict | None:
@@ -380,6 +474,9 @@ def get_transcript_for_source(source: dict, allow_audio_fallback: bool, openai_a
         "timedtext_tracks_found": 0,
         "timedtext_best_track": None,
         "timedtext_fetch_status": None,
+        "timedtext_list_http_status": None,
+        "timedtext_list_body_len": None,
+        "timedtext_list_body_head": None,
         "transcript_method_final": None,
     }
 
@@ -409,7 +506,8 @@ def get_transcript_for_source(source: dict, allow_audio_fallback: bool, openai_a
         diagnostics["yta_error"] = str(exc)
 
     try:
-        tracks = _timedtext_list_tracks(video_id)
+        tracks, timedtext_list_diagnostics = _timedtext_list_tracks(video_id)
+        diagnostics.update(timedtext_list_diagnostics)
         diagnostics["timedtext_tracks_found"] = len(tracks)
         best_track = _pick_best_track(tracks)
         diagnostics["timedtext_best_track"] = (
