@@ -23,6 +23,10 @@ class TranscriptionError(RuntimeError):
         self.code = code
 
 
+class TranscriptUnavailableError(TranscriptionError):
+    pass
+
+
 def _video_id_from_url(url: str) -> str:
     parsed = urlparse(url)
     if parsed.netloc.endswith("youtu.be"):
@@ -43,39 +47,12 @@ def _normalize_segments(items: list[dict]) -> list[dict]:
     return [s for s in segments if s["text"]]
 
 
-def _fetch_with_transcript_list(video_id: str) -> tuple[list[dict], str | None]:
-    transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+def _fetch_youtube_transcript(video_id: str) -> tuple[list[dict], str | None]:
     try:
-        transcript = transcript_list.find_transcript(["en"])
-    except NoTranscriptFound:
-        transcript = next(iter(transcript_list), None)
-        if transcript is None:
-            raise
-    fetched = transcript.fetch()
-    language = getattr(transcript, "language_code", None)
-    return fetched, language
-
-
-def _fetch_with_get_transcript(video_id: str) -> tuple[list[dict], str | None]:
-    last_error: Exception | None = None
-    for languages in (["en"], ["en-US", "en-GB"], None):
-        kwargs = {} if languages is None else {"languages": languages}
-        try:
-            fetched = YouTubeTranscriptApi.get_transcript(video_id, **kwargs)
-            language = languages[0] if languages else None
-            return fetched, language
-        except TypeError:
-            if languages is not None:
-                continue
-            raise
-        except NoTranscriptFound as exc:
-            last_error = exc
-            if languages is None:
-                raise
-            continue
-    if last_error:
-        raise last_error
-    raise RuntimeError("Unable to fetch transcript with get_transcript")
+        return YouTubeTranscriptApi.get_transcript(video_id, languages=["en"]), "en"
+    except Exception:
+        fetched = YouTubeTranscriptApi.get_transcript(video_id)
+        return fetched, None
 
 
 def _full_text(segments: list[dict]) -> str:
@@ -134,17 +111,18 @@ def _transcribe_with_openai_audio(source: dict) -> dict:
         }
 
 
-def transcribe_youtube_source(source: dict, allow_audio_fallback: bool = False) -> dict:
+def get_transcript_for_source(source: dict, allow_audio_fallback: bool, openai_api_key_present: bool) -> dict:
     video_id = _video_id_from_url(source["url"])
     if not video_id:
-        raise RuntimeError(f"Unable to extract YouTube video id from URL: {source['url']}")
+        raise TranscriptionError(
+            f"Unable to extract YouTube video id from URL: {source['url']}",
+            video_id="",
+            url=source["url"],
+            code="invalid_video_url",
+        )
 
     try:
-        if hasattr(YouTubeTranscriptApi, "list_transcripts"):
-            fetched, language = _fetch_with_transcript_list(video_id)
-        else:
-            fetched, language = _fetch_with_get_transcript(video_id)
-
+        fetched, language = _fetch_youtube_transcript(video_id)
         segments = _normalize_segments(fetched)
         if not segments:
             raise TranscriptionError(
@@ -163,16 +141,32 @@ def transcribe_youtube_source(source: dict, allow_audio_fallback: bool = False) 
             "full_text": _full_text(segments),
         }
     except (NoTranscriptFound, TranscriptsDisabled, VideoUnavailable, TooManyRequests) as exc:
-        if allow_audio_fallback and os.getenv("OPENAI_API_KEY"):
+        if not allow_audio_fallback:
+            raise TranscriptUnavailableError(
+                "No transcript available (audio fallback disabled).",
+                video_id=video_id,
+                url=source["url"],
+                code="transcript_unavailable_disabled",
+            ) from exc
+
+        if not openai_api_key_present:
+            raise TranscriptionError(
+                "transcript_unavailable (will attempt audio fallback): Audio fallback requires OPENAI_API_KEY.",
+                video_id=video_id,
+                url=source["url"],
+                code="audio_fallback_requires_openai_key",
+            ) from exc
+
+        try:
             return _transcribe_with_openai_audio(source)
-        raise TranscriptionError(str(exc), video_id=video_id, url=source["url"], code=exc.__class__.__name__) from exc
+        except Exception as audio_exc:
+            raise TranscriptionError(
+                f"transcript_unavailable (will attempt audio fallback); audio_fallback_failed: {audio_exc}",
+                video_id=video_id,
+                url=source["url"],
+                code="audio_fallback_failed",
+            ) from audio_exc
     except TranscriptionError:
         raise
     except Exception as exc:
-        if allow_audio_fallback and os.getenv("OPENAI_API_KEY"):
-            return _transcribe_with_openai_audio(source)
-        raise TranscriptionError(str(exc), video_id=video_id, url=source["url"]) from exc
-
-
-def transcribe(source: dict, allow_audio_fallback: bool = False) -> dict:
-    return transcribe_youtube_source(source=source, allow_audio_fallback=allow_audio_fallback)
+        raise TranscriptionError(str(exc), video_id=video_id, url=source["url"], code="transcription_error") from exc
