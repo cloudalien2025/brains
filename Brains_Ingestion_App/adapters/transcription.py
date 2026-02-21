@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import os
 import tempfile
+from html import unescape
 from pathlib import Path
+from urllib.request import Request, urlopen
 from urllib.parse import parse_qs, urlparse
+import xml.etree.ElementTree as ET
 
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api import _errors as transcript_errors
@@ -13,6 +16,16 @@ TranscriptsDisabled = getattr(transcript_errors, "TranscriptsDisabled", Exceptio
 NoTranscriptFound = getattr(transcript_errors, "NoTranscriptFound", Exception)
 VideoUnavailable = getattr(transcript_errors, "VideoUnavailable", Exception)
 TooManyRequests = getattr(transcript_errors, "TooManyRequests", Exception)
+
+
+TIMEDTEXT_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/122.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
 
 class TranscriptionError(RuntimeError):
@@ -57,6 +70,113 @@ def _fetch_youtube_transcript(video_id: str) -> tuple[list[dict], str | None]:
 
 def _full_text(segments: list[dict]) -> str:
     return " ".join(seg["text"] for seg in segments).strip()
+
+
+def _parse_timestamp_seconds(value: str) -> float:
+    part = value.strip().replace(",", ".")
+    units = part.split(":")
+    if len(units) == 3:
+        hours, minutes, seconds = units
+    elif len(units) == 2:
+        hours = "0"
+        minutes, seconds = units
+    else:
+        return float(part)
+    return float(hours) * 3600 + float(minutes) * 60 + float(seconds)
+
+
+def _parse_webvtt_segments(body: str) -> list[dict]:
+    segments: list[dict] = []
+    blocks = body.replace("\r\n", "\n").split("\n\n")
+    for block in blocks:
+        lines = [line.strip() for line in block.splitlines() if line.strip()]
+        if not lines:
+            continue
+
+        cue_index = 0
+        if "-->" not in lines[cue_index] and len(lines) > 1 and "-->" in lines[1]:
+            cue_index = 1
+        if "-->" not in lines[cue_index]:
+            continue
+
+        start_raw, end_raw = [part.strip() for part in lines[cue_index].split("-->", 1)]
+        text = " ".join(lines[cue_index + 1 :]).strip()
+        if not text:
+            continue
+
+        start = _parse_timestamp_seconds(start_raw.split(" ")[0])
+        end = _parse_timestamp_seconds(end_raw.split(" ")[0])
+        duration = max(0.0, end - start)
+        segments.append({"start": start, "duration": duration, "text": text})
+
+    return segments
+
+
+def _parse_timedtext_segments(body: str) -> list[dict]:
+    trimmed = body.strip()
+    if not trimmed:
+        return []
+
+    if "<text" in trimmed:
+        try:
+            root = ET.fromstring(trimmed)
+        except ET.ParseError:
+            return []
+
+        segments: list[dict] = []
+        for node in root.findall(".//text"):
+            raw_text = "".join(node.itertext()) if node is not None else ""
+            text = unescape(raw_text).strip()
+            if not text:
+                continue
+            start = float(node.attrib.get("start", 0.0))
+            duration = float(node.attrib.get("dur", 0.0))
+            segments.append({"start": start, "duration": duration, "text": text})
+        return segments
+
+    if "-->" in trimmed or trimmed.startswith("WEBVTT"):
+        return _parse_webvtt_segments(trimmed)
+
+    return []
+
+
+def fetch_timedtext(video_id: str, lang: str = "en") -> dict | None:
+    candidate_langs = [lang]
+    if lang == "en":
+        candidate_langs.extend(["en-US", "en-GB"])
+
+    for language in candidate_langs:
+        urls = [
+            f"https://www.youtube.com/api/timedtext?lang={language}&v={video_id}",
+            f"https://www.youtube.com/api/timedtext?lang={language}&v={video_id}&kind=asr",
+        ]
+        for timedtext_url in urls:
+            request = Request(timedtext_url, headers=TIMEDTEXT_HEADERS)
+            try:
+                with urlopen(request, timeout=10) as response:
+                    if response.status != 200:
+                        continue
+                    body = response.read().decode("utf-8", errors="replace")
+            except Exception:
+                continue
+
+            if not body.strip():
+                continue
+            lowered = body.lower()
+            if "<text" not in lowered and "-->" not in body and "webvtt" not in lowered:
+                continue
+
+            segments = _parse_timedtext_segments(body)
+            if not segments:
+                continue
+            return {
+                "video_id": video_id,
+                "method": "youtube_timedtext",
+                "language": language,
+                "segments": segments,
+            }
+
+    return None
 
 
 def _transcribe_with_openai_audio(source: dict) -> dict:
@@ -141,9 +261,15 @@ def get_transcript_for_source(source: dict, allow_audio_fallback: bool, openai_a
             "full_text": _full_text(segments),
         }
     except (NoTranscriptFound, TranscriptsDisabled, VideoUnavailable, TooManyRequests) as exc:
+        timedtext = fetch_timedtext(video_id, "en")
+        if timedtext:
+            timedtext["url"] = source["url"]
+            timedtext["full_text"] = _full_text(timedtext["segments"])
+            return timedtext
+
         if not allow_audio_fallback:
             raise TranscriptUnavailableError(
-                "No transcript available (audio fallback disabled).",
+                "transcript_unavailable_yta; transcript_unavailable_timedtext; No transcript available (audio fallback disabled).",
                 video_id=video_id,
                 url=source["url"],
                 code="transcript_unavailable_disabled",
@@ -151,7 +277,7 @@ def get_transcript_for_source(source: dict, allow_audio_fallback: bool, openai_a
 
         if not openai_api_key_present:
             raise TranscriptionError(
-                "transcript_unavailable (will attempt audio fallback): Audio fallback requires OPENAI_API_KEY.",
+                "transcript_unavailable_yta; transcript_unavailable_timedtext; Audio fallback requires OPENAI_API_KEY.",
                 video_id=video_id,
                 url=source["url"],
                 code="audio_fallback_requires_openai_key",
@@ -161,7 +287,7 @@ def get_transcript_for_source(source: dict, allow_audio_fallback: bool, openai_a
             return _transcribe_with_openai_audio(source)
         except Exception as audio_exc:
             raise TranscriptionError(
-                f"transcript_unavailable (will attempt audio fallback); audio_fallback_failed: {audio_exc}",
+                f"transcript_unavailable_yta; transcript_unavailable_timedtext; audio_fallback_failed: {audio_exc}",
                 video_id=video_id,
                 url=source["url"],
                 code="audio_fallback_failed",
