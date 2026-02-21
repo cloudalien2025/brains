@@ -5,12 +5,14 @@ import tempfile
 from html import unescape
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlparse
-from urllib.request import Request, urlopen
 import xml.etree.ElementTree as ET
 
+import requests
 import youtube_transcript_api as yta
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api import _errors as transcript_errors
+
+from brains.net.http_client import HttpClient
 
 
 TranscriptsDisabled = getattr(transcript_errors, "TranscriptsDisabled", Exception)
@@ -42,6 +44,10 @@ TIMEDTEXT_HEADERS = {
     ),
     "Accept-Language": "en-US,en;q=0.9",
 }
+
+def _http_client() -> HttpClient:
+    return HttpClient()
+
 
 
 class TranscriptionError(RuntimeError):
@@ -232,7 +238,7 @@ def _parse_timedtext_segments(body: str) -> list[dict]:
     return []
 
 
-def fetch_timedtext(video_id: str, lang: str = "en") -> dict | None:
+def fetch_timedtext(video_id: str, lang: str = "en", proxy_session_key: str | None = None) -> dict | None:
     candidate_langs = [lang]
     if lang == "en":
         candidate_langs.extend(["en-US", "en-GB"])
@@ -243,15 +249,16 @@ def fetch_timedtext(video_id: str, lang: str = "en") -> dict | None:
             f"https://www.youtube.com/api/timedtext?lang={language}&v={video_id}&kind=asr",
         ]
         for timedtext_url in urls:
-            request = Request(timedtext_url, headers=TIMEDTEXT_HEADERS)
-            try:
-                with urlopen(request, timeout=10) as response:
-                    if response.status != 200:
-                        continue
-                    body = response.read().decode("utf-8", errors="replace")
-            except Exception:
+            response = _http_client().get(
+                timedtext_url,
+                headers=TIMEDTEXT_HEADERS,
+                timeout_seconds=10,
+                proxy_session_key=proxy_session_key,
+                treat_empty_as_block=True,
+            )
+            if response.status_code != 200:
                 continue
-
+            body = response.text
             if not body.strip():
                 continue
             lowered = body.lower()
@@ -271,31 +278,25 @@ def fetch_timedtext(video_id: str, lang: str = "en") -> dict | None:
     return None
 
 
-def _timedtext_list_tracks(video_id: str) -> tuple[list[dict], dict]:
-    request = Request(
+def _timedtext_list_tracks(video_id: str, proxy_session_key: str | None = None) -> tuple[list[dict], dict]:
+    response = _http_client().get(
         f"https://www.youtube.com/api/timedtext?type=list&v={video_id}",
         headers={
             **TIMEDTEXT_HEADERS,
             "Accept": "text/plain,text/vtt,application/xml,text/xml,*/*",
         },
+        timeout_seconds=10,
+        proxy_session_key=proxy_session_key,
+        treat_empty_as_block=True,
     )
+    body = response.text
     diagnostics = {
-        "timedtext_list_http_status": None,
-        "timedtext_list_body_len": None,
-        "timedtext_list_body_head": None,
+        "timedtext_list_http_status": response.status_code,
+        "timedtext_list_body_len": len(body),
+        "timedtext_list_body_head": body[:200],
     }
-    try:
-        with urlopen(request, timeout=10) as response:
-            diagnostics["timedtext_list_http_status"] = response.status
-            body = response.read().decode("utf-8", errors="replace")
-    except Exception as exc:
-        diagnostics["timedtext_list_http_status"] = f"error: {exc}"
-        return [], diagnostics
 
-    diagnostics["timedtext_list_body_len"] = len(body)
-    diagnostics["timedtext_list_body_head"] = body[:200]
-
-    if diagnostics["timedtext_list_http_status"] != 200:
+    if response.status_code != 200:
         return [], diagnostics
 
     trimmed = body.strip()
@@ -348,7 +349,7 @@ def _pick_best_track(tracks: list[dict]) -> dict | None:
     return any_auto[0] if any_auto else None
 
 
-def _timedtext_fetch_track(video_id: str, track: dict) -> dict | None:
+def _timedtext_fetch_track(video_id: str, track: dict, proxy_session_key: str | None = None) -> dict | None:
     params = {
         "v": video_id,
         "lang": track.get("lang_code") or "",
@@ -367,20 +368,18 @@ def _timedtext_fetch_track(video_id: str, track: dict) -> dict | None:
     for fmt, attempt_params in fetch_attempts:
         query = urlencode(attempt_params)
         timedtext_url = f"https://www.youtube.com/api/timedtext?{query}"
-        request = Request(
+        response = _http_client().get(
             timedtext_url,
             headers={
                 **TIMEDTEXT_HEADERS,
                 "Accept": "text/plain,text/vtt,application/xml,text/xml,*/*",
             },
+            timeout_seconds=10,
+            proxy_session_key=proxy_session_key,
+            treat_empty_as_block=True,
         )
-
-        try:
-            with urlopen(request, timeout=10) as response:
-                status = response.status
-                body = response.read().decode("utf-8", errors="replace")
-        except Exception:
-            continue
+        status = response.status_code
+        body = response.text
 
         if status != 200 or len(body) <= 50:
             continue
@@ -506,7 +505,7 @@ def get_transcript_for_source(source: dict, allow_audio_fallback: bool, openai_a
         diagnostics["yta_error"] = str(exc)
 
     try:
-        tracks, timedtext_list_diagnostics = _timedtext_list_tracks(video_id)
+        tracks, timedtext_list_diagnostics = _timedtext_list_tracks(video_id, proxy_session_key=video_id)
         diagnostics.update(timedtext_list_diagnostics)
         diagnostics["timedtext_tracks_found"] = len(tracks)
         best_track = _pick_best_track(tracks)
@@ -520,7 +519,7 @@ def get_transcript_for_source(source: dict, allow_audio_fallback: bool, openai_a
             else None
         )
         if best_track:
-            timedtext = _timedtext_fetch_track(video_id, best_track)
+            timedtext = _timedtext_fetch_track(video_id, best_track, proxy_session_key=video_id)
             diagnostics["timedtext_fetch_status"] = (
                 timedtext.get("timedtext_fetch_status") if timedtext else "empty"
             )
@@ -599,3 +598,34 @@ def get_transcript_for_source(source: dict, allow_audio_fallback: bool, openai_a
             code="audio_fallback_failed",
             diagnostics=diagnostics,
         ) from audio_exc
+
+
+def get_transcript_from_worker(
+    source: dict,
+    *,
+    worker_url: str,
+    worker_api_key: str,
+    allow_audio_fallback: bool,
+    prefer_lang: list[str] | None = None,
+) -> dict:
+    response = requests.post(
+        f"{worker_url.rstrip('/')}/transcript",
+        headers={"X-Brains-Worker-Key": worker_api_key, "Content-Type": "application/json"},
+        json={
+            "video_id": _video_id_from_url(source["url"]),
+            "prefer_lang": prefer_lang or ["en"],
+            "allow_audio_fallback": allow_audio_fallback,
+        },
+        timeout=60,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    return {
+        "url": source["url"],
+        "video_id": payload.get("video_id") or _video_id_from_url(source["url"]),
+        "method": payload.get("method", "worker"),
+        "language": payload.get("language"),
+        "segments": payload.get("segments", []),
+        "full_text": payload.get("text", "").strip(),
+        "diagnostics": payload.get("diagnostics", {}),
+    }

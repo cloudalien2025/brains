@@ -5,7 +5,8 @@ Streamlit app for generating validated Brain Packs from real YouTube discovery a
 ## Features
 
 - Real YouTube discovery using YouTube Data API v3.
-- Transcript-first ingestion (`youtube-transcript-api`) with optional audio fallback (`yt-dlp` + OpenAI transcription).
+- Generic proxy-backed HTTP layer (Decodo-ready) used by timedtext/transcript fetches.
+- Optional DigitalOcean worker routing for transcript extraction.
 - Structured record extraction with evidence (URL + timestamps when available).
 - Strict JSON Schema validation before writing any Brain Pack files.
 - Local pack write + in-app ZIP download for ephemeral deployments.
@@ -14,6 +15,25 @@ Streamlit app for generating validated Brain Packs from real YouTube discovery a
 
 - `YOUTUBE_API_KEY` (required)
 - `OPENAI_API_KEY` (optional but recommended for richer extraction and audio fallback)
+
+## Optional Decodo proxy secrets
+
+- `DECODO_ENABLED=true|false` (default `false`)
+- `DECODO_GATEWAY_HOST=gate.decodo.com`
+- `DECODO_GATEWAY_PORT=7000`
+- `DECODO_USER=...`
+- `DECODO_PASS=...`
+- `DECODO_COUNTRY=us` (optional)
+- `DECODO_STICKY_MODE=per_video|off` (default `per_video`)
+- `DECODO_TIMEOUT_SECONDS=30`
+- `DECODO_MAX_RETRIES=3`
+
+## Optional worker settings
+
+- `BRAINS_WORKER_URL=https://<domain-or-ip>`
+- `BRAINS_WORKER_API_KEY=<secret>`
+
+If `BRAINS_WORKER_URL` is set, Streamlit routes transcript extraction to the worker first and falls back to local extraction if worker calls fail.
 
 ## Run
 
@@ -25,8 +45,26 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## Deployment Notes (Streamlit Cloud)
+## Worker API (FastAPI)
 
-- Transcript-first mode is the most reliable cloud path.
-- Audio fallback can require system `ffmpeg` depending on source media/container behavior.
-- Keep `Allow audio transcription fallback` off unless you have runtime support for `yt-dlp` workflows and accept additional API costs/latency.
+Run locally:
+
+```bash
+uvicorn apps.brains_worker.main:app --host 0.0.0.0 --port 8000
+```
+
+Endpoints:
+
+- `GET /health`
+- `POST /transcript` with `X-Brains-Worker-Key` header.
+
+## Deployment Notes (DigitalOcean Ubuntu 22.04)
+
+1. Install runtime deps: `python3-venv python3-pip ffmpeg`.
+2. Clone repo to `/opt/brains/brains` and create `.venv`.
+3. `pip install -r requirements.txt` (plus `youtube-transcript-api`/`yt-dlp` if needed).
+4. Create `/opt/brains/brains/.env.worker` with Decodo + `BRAINS_WORKER_API_KEY`.
+5. Add systemd service:
+   - `ExecStart=/opt/brains/brains/.venv/bin/uvicorn apps.brains_worker.main:app --host 0.0.0.0 --port 8000`
+6. `sudo systemctl daemon-reload && sudo systemctl enable --now brains-worker`.
+7. Put nginx/TLS in front or restrict firewall ingress.
