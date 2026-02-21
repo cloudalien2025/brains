@@ -608,14 +608,19 @@ def get_transcript_from_worker(
     allow_audio_fallback: bool,
     prefer_lang: list[str] | None = None,
 ) -> dict:
+    base_url = worker_url.rstrip("/")
+    if base_url.endswith("/transcribe"):
+        base_url = base_url[: -len("/transcribe")]
+    if base_url.endswith("/transcript"):
+        base_url = base_url[: -len("/transcript")]
+
     response = requests.post(
-        f"{worker_url.rstrip('/')}/transcript",
+        f"{base_url}/transcript",
         headers={"X-Api-Key": worker_api_key, "Content-Type": "application/json"},
         json={
             "source_id": f"yt:{_video_id_from_url(source['url'])}",
             "url": source["url"],
-            "language": (prefer_lang or ["en"])[0] if (prefer_lang or ["en"]) else None,
-            "allow_audio_fallback": allow_audio_fallback,
+            "preferred_langs": prefer_lang or ["en", "en-US", "en-GB"],
         },
         timeout=60,
     )
