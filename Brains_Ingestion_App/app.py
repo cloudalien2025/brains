@@ -9,7 +9,7 @@ from uuid import uuid4
 import streamlit as st
 
 from adapters.extraction import extract_brain_records
-from adapters.transcription import TranscriptionError, transcribe
+from adapters.transcription import TranscriptionError, get_transcript_for_source
 from adapters.youtube_discovery import discover_youtube_videos
 from brainpack.exporters import build_pack_zip, write_json, write_jsonl, write_sources_csv
 from brainpack.utils import now_iso, slugify
@@ -28,8 +28,9 @@ use_openai_extraction = st.toggle(
 )
 allow_audio_fallback = st.toggle("Allow audio transcription fallback", value=False)
 
+st.caption("Default ingestion is transcript-first and does not download video/audio streams.")
 if allow_audio_fallback:
-    st.warning("Audio fallback can require yt-dlp/ffmpeg and may increase latency/cost.")
+    st.warning("Audio fallback uses yt-dlp/ffmpeg + OpenAI and can fail on Streamlit Cloud; it is recommended for local runs.")
 
 if "advanced_logs" not in st.session_state:
     st.session_state.advanced_logs = []
@@ -45,6 +46,7 @@ if st.button("Generate Brain Pack", type="primary"):
     per_video_errors: list[str] = []
     validation_errors: list[str] = []
     started_at = now_iso()
+    openai_api_key_present = bool(os.getenv("OPENAI_API_KEY"))
 
     if not os.getenv("YOUTUBE_API_KEY"):
         st.error("YOUTUBE_API_KEY is required in real ingestion mode.")
@@ -88,15 +90,25 @@ if st.button("Generate Brain Pack", type="primary"):
         _log(video_key, "Discovery status: queued")
 
         try:
-            transcript = transcribe(source, allow_audio_fallback=allow_audio_fallback)
+            transcript = get_transcript_for_source(
+                source,
+                allow_audio_fallback=allow_audio_fallback,
+                openai_api_key_present=openai_api_key_present,
+            )
             transcript["source"] = source
             _log(video_key, f"Transcript method used: {transcript.get('method')}")
         except TranscriptionError as exc:
             failed_sources += 1
-            err = f"transcription:{video_key} {exc.code}: {exc}"
+            if exc.code == "transcript_unavailable_disabled":
+                label = "transcript_unavailable (audio fallback disabled)"
+            elif exc.code in {"audio_fallback_failed", "audio_fallback_requires_openai_key"}:
+                label = str(exc)
+            else:
+                label = f"{exc.code}: {exc}"
+            err = f"transcription:{video_key} {label}"
             runtime_errors.append(err)
-            per_video_errors.append(f"{video_key}: {exc}")
-            _log(video_key, f"Transcript failed: {exc}")
+            per_video_errors.append(f"{video_key}: {label}")
+            _log(video_key, f"Transcript failed: {label}")
             continue
         except Exception as exc:
             failed_sources += 1
@@ -112,7 +124,7 @@ if st.button("Generate Brain Pack", type="primary"):
                 keyword=keyword,
                 source=source,
                 transcript=transcript,
-                use_openai=use_openai_extraction and bool(os.getenv("OPENAI_API_KEY")),
+                use_openai=use_openai_extraction and openai_api_key_present,
             )
             additions_blocks.append(additions_md)
             _log(video_key, f"Extraction counts: {len(source_records)}")
