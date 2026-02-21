@@ -9,7 +9,7 @@ from uuid import uuid4
 import streamlit as st
 
 from adapters.extraction import extract_brain_records
-from adapters.transcription import transcribe
+from adapters.transcription import TranscriptionError, transcribe
 from adapters.youtube_discovery import discover_youtube_videos
 from brainpack.exporters import build_pack_zip, write_json, write_jsonl, write_sources_csv
 from brainpack.utils import now_iso, slugify
@@ -41,7 +41,9 @@ def _log(video_id: str, message: str) -> None:
 
 if st.button("Generate Brain Pack", type="primary"):
     st.session_state.advanced_logs = []
-    errors: list[str] = []
+    runtime_errors: list[str] = []
+    per_video_errors: list[str] = []
+    validation_errors: list[str] = []
     started_at = now_iso()
 
     if not os.getenv("YOUTUBE_API_KEY"):
@@ -57,7 +59,7 @@ if st.button("Generate Brain Pack", type="primary"):
     for src in videos:
         source_errors = validate_source(src)
         if source_errors:
-            errors.extend([f"source:{src.get('source_id', 'unknown')} {err}" for err in source_errors])
+            validation_errors.extend([f"source:{src.get('source_id', 'unknown')} {err}" for err in source_errors])
 
     st.subheader("Discovery results")
     st.dataframe(videos, use_container_width=True)
@@ -76,37 +78,57 @@ if st.button("Generate Brain Pack", type="primary"):
         st.stop()
 
     queue = videos[: int(max_videos)]
-    transcripts: list[dict] = []
     records: list[dict] = []
     additions_blocks: list[str] = []
+    successful_sources = 0
+    failed_sources = 0
 
     for source in queue:
         video_key = source.get("source_id", "unknown")
         _log(video_key, "Discovery status: queued")
+
         try:
             transcript = transcribe(source, allow_audio_fallback=allow_audio_fallback)
             transcript["source"] = source
-            transcripts.append(transcript)
             _log(video_key, f"Transcript method used: {transcript.get('method')}")
+        except TranscriptionError as exc:
+            failed_sources += 1
+            err = f"transcription:{video_key} {exc.code}: {exc}"
+            runtime_errors.append(err)
+            per_video_errors.append(f"{video_key}: {exc}")
+            _log(video_key, f"Transcript failed: {exc}")
+            continue
         except Exception as exc:
-            errors.append(f"transcription:{video_key} {exc}")
+            failed_sources += 1
+            err = f"transcription:{video_key} {exc}"
+            runtime_errors.append(err)
+            per_video_errors.append(f"{video_key}: {exc}")
             _log(video_key, f"Transcript failed: {exc}")
             continue
 
-        source_records, additions_md = extract_brain_records(
-            brain="BD_Brain",
-            keyword=keyword,
-            source=source,
-            transcript=transcript,
-            use_openai=use_openai_extraction and bool(os.getenv("OPENAI_API_KEY")),
-        )
-        additions_blocks.append(additions_md)
-        _log(video_key, f"Extraction counts: {len(source_records)}")
+        try:
+            source_records, additions_md = extract_brain_records(
+                brain="BD_Brain",
+                keyword=keyword,
+                source=source,
+                transcript=transcript,
+                use_openai=use_openai_extraction and bool(os.getenv("OPENAI_API_KEY")),
+            )
+            additions_blocks.append(additions_md)
+            _log(video_key, f"Extraction counts: {len(source_records)}")
+            successful_sources += 1
+        except Exception as exc:
+            failed_sources += 1
+            err = f"extraction:{video_key} {exc}"
+            runtime_errors.append(err)
+            per_video_errors.append(f"{video_key}: {exc}")
+            _log(video_key, f"Extraction failed: {exc}")
+            continue
 
         for rec in source_records:
             record_errors = validate_record(rec)
             if record_errors:
-                errors.extend([f"record:{rec.get('id', 'unknown')} {err}" for err in record_errors])
+                validation_errors.extend([f"record:{rec.get('id', 'unknown')} {err}" for err in record_errors])
         records.extend(source_records)
 
     run_metadata = {
@@ -120,14 +142,14 @@ if st.button("Generate Brain Pack", type="primary"):
             "use_openai_extraction": use_openai_extraction,
             "allow_audio_fallback": allow_audio_fallback,
         },
-        "errors": errors,
+        "errors": runtime_errors,
         "env": {
             "python_version": platform.python_version(),
             "platform": platform.platform(),
             "has_youtube_api_key": bool(os.getenv("YOUTUBE_API_KEY")),
         },
     }
-    errors.extend([f"run_metadata {err}" for err in validate_run_metadata(run_metadata)])
+    validation_errors.extend([f"run_metadata {err}" for err in validate_run_metadata(run_metadata)])
 
     pack_slug = slugify(keyword)
     pack_name = f"{started_at[:10]}__{pack_slug}__pack_v1"
@@ -154,17 +176,26 @@ if st.button("Generate Brain Pack", type="primary"):
             "records_extracted": len(records),
         },
     }
-    manifest_errors = validate_pack_manifest(manifest)
-    errors.extend([f"pack_manifest {err}" for err in manifest_errors])
+    validation_errors.extend([f"pack_manifest {err}" for err in validate_pack_manifest(manifest)])
 
-    validation_status = "passed" if not errors else "failed"
+    validation_status = "passed" if not validation_errors else "failed"
     for source in queue:
         _log(source.get("source_id", "unknown"), f"Validation status: {validation_status}")
 
-    if errors:
-        st.error("Validation failed. Brain Pack was not written.")
-        for err in errors:
+    st.info(f"Sources succeeded: {successful_sources} | Sources failed: {failed_sources}")
+    if per_video_errors:
+        st.subheader("Per-video errors")
+        for err in per_video_errors:
             st.write(f"- {err}")
+
+    if validation_errors:
+        st.error("Validation failed. Brain Pack was not written.")
+        for err in validation_errors:
+            st.write(f"- {err}")
+        st.stop()
+
+    if not records:
+        st.warning("No transcripts/extractions succeeded; pack not created.")
         st.stop()
 
     pack_dir.mkdir(parents=True, exist_ok=True)
