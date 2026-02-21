@@ -8,6 +8,7 @@ from uuid import uuid4
 
 import requests
 import streamlit as st
+from streamlit.errors import StreamlitSecretNotFoundError
 
 from adapters.extraction import extract_brain_records
 from adapters.transcription import (
@@ -27,6 +28,18 @@ from brains.net.proxy_manager import ProxyConfig, ProxyManager
 
 def _bool_env(name: str, default: bool = False) -> bool:
     return os.getenv(name, str(default)).lower() == "true"
+
+
+def _secret_or_env(name: str) -> str:
+    try:
+        secret_value = st.secrets.get(name)
+    except StreamlitSecretNotFoundError:
+        secret_value = None
+    if secret_value is not None:
+        return str(secret_value).strip()
+    return (os.getenv(name) or "").strip()
+
+
 st.set_page_config(page_title="Brains Ingestion", layout="wide")
 st.title("Brains Ingestion")
 
@@ -47,8 +60,8 @@ proxy_sticky = st.checkbox(
 )
 proxy_country = st.text_input("Country (optional)", value=os.getenv("DECODO_COUNTRY", ""), disabled=not proxy_enabled)
 
-worker_url = (os.getenv("BRAINS_WORKER_URL") or "").strip()
-worker_api_key = (os.getenv("BRAINS_WORKER_API_KEY") or "").strip()
+worker_url = _secret_or_env("BRAINS_WORKER_URL")
+worker_api_key = _secret_or_env("BRAINS_WORKER_API_KEY")
 
 st.subheader("Worker Status")
 if worker_url and worker_api_key:
@@ -77,6 +90,11 @@ if allow_audio_fallback:
     st.warning("Audio fallback uses yt-dlp/ffmpeg + OpenAI and can fail on Streamlit Cloud; it is recommended for local runs.")
 if worker_url:
     st.info(f"Worker routing enabled: {worker_url}")
+
+with st.expander("Worker diagnostics", expanded=False):
+    st.write(f"worker_url present: {bool(worker_url)}")
+    st.write(f"worker_api_key present: {bool(worker_api_key)}")
+    st.write(f"worker_api_key length: {len(worker_api_key)}")
 
 with st.expander("Proxy diagnostics", expanded=False):
     st.json(proxy_manager.safe_diagnostics())
