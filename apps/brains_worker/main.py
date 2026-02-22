@@ -57,6 +57,80 @@ def _tail(value: str | None, limit: int = 300) -> str:
     return (value or "")[-limit:]
 
 
+def _sanitize_sniff(value: str | None, limit: int = 800) -> str:
+    if not value:
+        return ""
+    cleaned = "".join(ch if ch.isprintable() or ch in {"\n", "\r", "\t"} else " " for ch in value)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned[:limit]
+
+
+def _classify_caption_sniff(sniff: str) -> str:
+    compact = (sniff or "").strip()
+    if not compact:
+        return "EMPTY"
+    upper = compact[:160].upper()
+    if upper.startswith("WEBVTT"):
+        return "WEBVTT"
+    if upper.startswith("{") or ('"EVENTS"' in upper and "{" in upper):
+        return "JSON"
+    if upper.startswith("<"):
+        if "<HTML" in upper or "<!DOCTYPE HTML" in upper:
+            return "HTML"
+        if "<TT" in upper or "<TRANSCRIPT" in upper or "<?XML" in upper:
+            return "XML"
+        return "UNKNOWN"
+    if "CONSENT.YOUTUBE.COM" in upper or "<FORM" in upper:
+        return "HTML"
+    return "UNKNOWN"
+
+
+def _redact_ytdlp_stderr(stderr: str | None, limit: int = 500) -> str:
+    if not stderr:
+        return ""
+    redacted = re.sub(r"(https?://)([^\s/@:]+):([^\s/@]+)@", r"\1***:***@", stderr)
+    redacted = re.sub(r"(?i)(signature|sig|sparams|lsig|key|expire|token)=([^&\s]+)", r"\1=<redacted>", redacted)
+    return _sanitize_sniff(redacted, limit)
+
+
+def _build_caption_url_fmt(track: dict[str, Any], fmt: str = "vtt") -> str:
+    lang = track.get("languageCode") or ""
+    kind = track.get("kind") or ""
+    raw_name = track.get("name")
+    name = (raw_name.get("simpleText") if isinstance(raw_name, dict) else raw_name) or ""
+    return f"lang={lang}&kind={kind}&name={name}&fmt={fmt}"
+
+
+def _parse_json3_subtitle_to_text(raw: str) -> str:
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        return ""
+    events = payload.get("events") if isinstance(payload, dict) else None
+    if not isinstance(events, list):
+        return ""
+
+    lines: list[str] = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        segs = event.get("segs")
+        if not isinstance(segs, list):
+            continue
+        parts: list[str] = []
+        for seg in segs:
+            if isinstance(seg, dict):
+                utf8 = seg.get("utf8")
+                if isinstance(utf8, str):
+                    cleaned = _strip_caption_markup(utf8)
+                    if cleaned:
+                        parts.append(cleaned)
+        line = " ".join(parts).strip()
+        if line:
+            lines.append(line)
+    return re.sub(r"\s+", " ", " ".join(lines)).strip()
+
+
 def _safe_ytdlp_available() -> bool:
     path = shutil.which("yt-dlp")
     if path:
@@ -305,16 +379,16 @@ def _parse_subtitle_to_text(raw: str, ext: str) -> str:
     return ""
 
 
-def _download_text(url: str, proxy: str | None) -> tuple[HTTPStatusValue, str | None]:
+def _download_text(url: str, proxy: str | None) -> tuple[HTTPStatusValue, str | None, str | None]:
     proxies = {"http": proxy, "https": proxy} if proxy else None
     try:
         # Keep this lower so caption downloads can't eat the full Streamlit budget.
         response = requests.get(url, timeout=10, proxies=proxies, headers={"User-Agent": "Mozilla/5.0"})
         if response.status_code != 200:
-            return response.status_code, None
-        return response.status_code, response.text
+            return response.status_code, None, response.headers.get("Content-Type")
+        return response.status_code, response.text, response.headers.get("Content-Type")
     except Exception:
-        return "exception", None
+        return "exception", None, None
 
 
 def _run_ytdlp_subtitles(youtube_url: str, preferred_language: str | None, proxy: str | None, work_dir: Path) -> tuple[str | None, dict[str, Any]]:
@@ -327,6 +401,7 @@ def _run_ytdlp_subtitles(youtube_url: str, preferred_language: str | None, proxy
         "ytdlp_subs_format": None,
         "ytdlp_subs_file_bytes": 0,
         "ytdlp_subs_file_path": None,
+        "ytdlp_subs_stderr_sniff": None,
     }
 
     yt_dlp = shutil.which("yt-dlp")
@@ -379,6 +454,7 @@ def _run_ytdlp_subtitles(youtube_url: str, preferred_language: str | None, proxy
 
     if proc.returncode != 0:
         diag["ytdlp_subs_error_code"] = "YTDLP_SUBS_FAILED"
+        diag["ytdlp_subs_stderr_sniff"] = _redact_ytdlp_stderr(proc.stderr)
         return None, diag
 
     files = [p for p in work_dir.glob("*.*") if p.suffix.lower().lstrip(".") in {"vtt", "srt", "ttml"}]
@@ -549,6 +625,12 @@ def _base_diagnostics(video_id: str, payload: TranscriptRequest, proxy_enabled: 
         "caption_tracks_found": 0,
         "caption_best_track": None,
         "caption_download_http_status": "exception",
+        "caption_download_url_fmt": None,
+        "caption_content_type": None,
+        "caption_body_chars": 0,
+        "caption_sniff": None,
+        "caption_sniff_hint": "EMPTY",
+        "caption_parse_error": None,
         "caption_parse_status": "skipped",
         "caption_chars": 0,
         "ytdlp_subs_attempted": False,
@@ -559,6 +641,7 @@ def _base_diagnostics(video_id: str, payload: TranscriptRequest, proxy_enabled: 
         "ytdlp_subs_format": None,
         "ytdlp_subs_file_bytes": 0,
         "ytdlp_subs_file_path": None,
+        "ytdlp_subs_stderr_sniff": None,
         "audio_fallback_enabled": payload.audio_fallback_enabled if payload.allow_audio_fallback is None else payload.allow_audio_fallback,
         "audio_fallback_attempted": False,
         "audio_download_status": "skipped",
@@ -645,18 +728,49 @@ def transcript(payload: TranscriptRequest, x_api_key: str | None = Header(defaul
                     base_url = best.get("baseUrl")
                     if base_url:
                         sep = "&" if "?" in base_url else "?"
-                        cap_status, cap_body = _download_text(f"{base_url}{sep}fmt=vtt", proxy_url)
+                        caption_url = f"{base_url}{sep}fmt=vtt"
+                        diagnostics["caption_download_url_fmt"] = _build_caption_url_fmt(best, fmt="vtt")
+                        cap_status, cap_body, cap_content_type = _download_text(caption_url, proxy_url)
                         diagnostics["caption_download_http_status"] = cap_status
+                        diagnostics["caption_content_type"] = cap_content_type
+                        diagnostics["caption_body_chars"] = len(cap_body or "")
+                        diagnostics["caption_sniff"] = _sanitize_sniff(cap_body, 800)
+                        diagnostics["caption_sniff_hint"] = _classify_caption_sniff(diagnostics["caption_sniff"])
                         if cap_body:
-                            parsed = _parse_subtitle_to_text(cap_body, "vtt")
+                            parsed = ""
+                            diagnostics["caption_parse_error"] = None
+                            try:
+                                parsed = _parse_subtitle_to_text(cap_body, "vtt")
+                            except Exception as exc:
+                                diagnostics["caption_parse_error"] = f"{type(exc).__name__}: {exc}"
+
+                            hint = diagnostics["caption_sniff_hint"]
+                            if not parsed or hint in {"XML", "JSON", "HTML"}:
+                                try:
+                                    if hint == "XML":
+                                        xml_parsed = _parse_subtitle_to_text(cap_body, "xml")
+                                        if xml_parsed:
+                                            parsed = xml_parsed
+                                    elif hint == "JSON":
+                                        json_parsed = _parse_json3_subtitle_to_text(cap_body)
+                                        if json_parsed:
+                                            parsed = json_parsed
+                                    elif hint == "HTML":
+                                        diagnostics["caption_parse_status"] = "blocked_html"
+                                except Exception as exc:
+                                    diagnostics["caption_parse_error"] = f"{type(exc).__name__}: {exc}"
+
                             if parsed:
                                 diagnostics["caption_parse_status"] = "success"
                                 diagnostics["caption_chars"] = len(parsed)
                                 diagnostics["pipeline_stage_success"] = "captions_player_json"
                                 diagnostics["transcript_chars"] = len(parsed)
+                                diagnostics["ytdlp_subs_attempted"] = False
+                                diagnostics["ytdlp_subs_status"] = "skipped_due_to_captions"
                                 diagnostics["elapsed_ms_total"] = int((time.perf_counter() - started) * 1000)
                                 return {"video_id": canonical_id, "transcript_source": "captions_player_json", "transcript_text": parsed, "diagnostics": diagnostics}
-                            diagnostics["caption_parse_status"] = "failed"
+                            if diagnostics["caption_parse_status"] != "blocked_html":
+                                diagnostics["caption_parse_status"] = "failed"
                         else:
                             diagnostics["caption_parse_status"] = "failed"
 

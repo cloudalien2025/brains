@@ -36,7 +36,7 @@ def test_stage1_player_json_success(monkeypatch):
         }, None
 
     def fake_download(url: str, proxy: str | None):
-        return 200, "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nhello stage one"
+        return 200, "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nhello stage one", "text/vtt"
 
     monkeypatch.setattr("apps.brains_worker.main._youtube_watch_player_json", fake_player)
     monkeypatch.setattr("apps.brains_worker.main._download_text", fake_download)
@@ -47,6 +47,42 @@ def test_stage1_player_json_success(monkeypatch):
     payload = response.json()
     assert payload["transcript_source"] == "captions_player_json"
     assert "hello stage one" in payload["transcript_text"]
+    assert payload["diagnostics"]["ytdlp_subs_attempted"] is False
+    assert payload["diagnostics"]["ytdlp_subs_status"] == "skipped_due_to_captions"
+
+
+def test_caption_json3_retry_parse(monkeypatch):
+    monkeypatch.setenv("BRAINS_API_KEY", "test-key")
+    from apps.brains_worker.main import app
+
+    def fake_player(video_id: str, proxy: str | None):
+        return 200, {
+            "captions": {
+                "playerCaptionsTracklistRenderer": {
+                    "captionTracks": [
+                        {
+                            "languageCode": "en",
+                            "kind": "asr",
+                            "name": {"simpleText": "English"},
+                            "baseUrl": "https://example.com/cap",
+                        }
+                    ]
+                }
+            }
+        }, None
+
+    def fake_download(url: str, proxy: str | None):
+        return 200, '{"events":[{"segs":[{"utf8":"hello "},{"utf8":"json3"}]}]}', "application/json"
+
+    monkeypatch.setattr("apps.brains_worker.main._youtube_watch_player_json", fake_player)
+    monkeypatch.setattr("apps.brains_worker.main._download_text", fake_download)
+
+    client = TestClient(app)
+    response = client.post("/transcript", headers={"x-api-key": "test-key"}, json={"video_id": "5lQf89-AeFo"})
+    assert response.status_code == 200
+    payload = response.json()
+    assert "hello json3" in payload["transcript_text"]
+    assert payload["diagnostics"]["caption_sniff_hint"] == "JSON"
 
 
 def test_stage2_ytdlp_subs_success(monkeypatch):
