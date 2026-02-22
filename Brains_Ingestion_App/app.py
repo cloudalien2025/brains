@@ -11,12 +11,6 @@ import streamlit as st
 from streamlit.errors import StreamlitSecretNotFoundError
 
 from adapters.extraction import extract_brain_records
-from adapters.transcription import (
-    TranscriptionError,
-    get_transcript_for_source,
-    get_transcript_from_worker,
-    get_yta_runtime_info,
-)
 from adapters.youtube_discovery import discover_youtube_videos
 from brainpack.exporters import build_pack_zip, write_json, write_jsonl, write_sources_csv
 from brainpack.utils import now_iso, slugify
@@ -43,6 +37,45 @@ def _secret_or_env(name: str) -> str:
 def _worker_headers(worker_api_key: str | None) -> dict:
     key = (worker_api_key or "").strip()
     return {"x-api-key": key, "Content-Type": "application/json"}
+
+
+def _safe_json(response: requests.Response) -> dict:
+    try:
+        payload = response.json()
+        return payload if isinstance(payload, dict) else {"payload": payload}
+    except Exception:
+        return {"raw": response.text[:2000]}
+
+
+def fetch_transcript_via_worker(
+    worker_url: str,
+    worker_api_key: str,
+    source_id: str,
+    *,
+    preferred_language: str | None = None,
+    allow_audio_fallback: bool = False,
+    proxy_enabled: bool = False,
+    proxy_country: str | None = None,
+    proxy_sticky: bool = False,
+    timeout: int = 300,
+) -> dict:
+    payload = {
+        "source_id": source_id,
+        "preferred_language": preferred_language,
+        "allow_audio_fallback": bool(allow_audio_fallback),
+        "proxy_enabled": bool(proxy_enabled),
+        "proxy_country": proxy_country,
+        "proxy_sticky": bool(proxy_sticky),
+    }
+    payload = {k: v for k, v in payload.items() if v is not None}
+
+    response = requests.post(
+        f"{worker_url.rstrip('/')}/transcript",
+        headers=_worker_headers(worker_api_key),
+        json=payload,
+        timeout=timeout,
+    )
+    return {"status_code": response.status_code, "json": _safe_json(response)}
 
 
 st.set_page_config(page_title="Brains Ingestion", layout="wide")
@@ -72,9 +105,9 @@ st.subheader("Worker Status")
 if worker_url and worker_api_key:
     st.success("Worker ACTIVE (URL + API key present)")
 elif worker_url and not worker_api_key:
-    st.error("Worker URL set but API key missing — running locally")
+    st.error("Worker URL set but API key missing")
 else:
-    st.warning("Worker disabled — running locally")
+    st.warning("Worker disabled")
 
 proxy_manager = ProxyManager(
     ProxyConfig(
@@ -92,7 +125,7 @@ proxy_manager = ProxyManager(
 
 st.caption("Default ingestion is transcript-first and does not download video/audio streams.")
 if allow_audio_fallback:
-    st.warning("Audio fallback uses yt-dlp/ffmpeg + OpenAI and can fail on Streamlit Cloud; it is recommended for local runs.")
+    st.info("Audio fallback will be requested from the worker if transcript captions are unavailable.")
 if worker_url:
     st.info(f"Worker routing enabled: {worker_url}")
 
@@ -138,7 +171,10 @@ if st.button("Generate Brain Pack", type="primary"):
     validation_errors: list[str] = []
     started_at = now_iso()
     openai_api_key_present = bool(os.getenv("OPENAI_API_KEY"))
-    yta_runtime = get_yta_runtime_info()
+
+    if not worker_url or not worker_api_key:
+        st.error("Worker not configured. Set BRAINS_WORKER_URL and BRAINS_WORKER_API_KEY in Streamlit Secrets.")
+        st.stop()
 
     if not os.getenv("YOUTUBE_API_KEY"):
         st.error("YOUTUBE_API_KEY is required in real ingestion mode.")
@@ -183,43 +219,52 @@ if st.button("Generate Brain Pack", type="primary"):
         _log(video_key, "Discovery status: queued")
 
         try:
-            if worker_url:
-                if not worker_api_key:
-                    raise RuntimeError("BRAINS_WORKER_API_KEY missing — refusing local transcript execution")
-                transcript = get_transcript_from_worker(
-                    source,
-                    worker_url=worker_url,
-                    worker_api_key=(worker_api_key or "").strip(),
-                    allow_audio_fallback=allow_audio_fallback,
-                )
-                _log(video_key, f"Worker transcript method used: {transcript.get('method')}")
-            else:
-                transcript = get_transcript_for_source(
-                    source,
-                    allow_audio_fallback=allow_audio_fallback,
-                    openai_api_key_present=openai_api_key_present,
-                )
+            worker_result = fetch_transcript_via_worker(
+                worker_url=worker_url,
+                worker_api_key=worker_api_key,
+                source_id=video_key,
+                preferred_language="en",
+                allow_audio_fallback=allow_audio_fallback,
+                proxy_enabled=proxy_enabled,
+                proxy_country=proxy_country.strip() or None,
+                proxy_sticky=proxy_sticky,
+            )
+            payload = worker_result.get("json", {})
+            status_code = worker_result.get("status_code")
+            diagnostics = payload.get("diagnostics", {}) if isinstance(payload, dict) else {}
+            video_diagnostics.append(
+                {
+                    "video_id": video_key,
+                    "worker_status_code": status_code,
+                    "worker_diagnostics": diagnostics,
+                }
+            )
+            _log(video_key, f"Worker response status: {status_code}")
+
+            transcript_text = (payload.get("text") or "").strip() if isinstance(payload, dict) else ""
+            transcript_segments = payload.get("segments") if isinstance(payload, dict) else None
+            has_segments = isinstance(transcript_segments, list) and len(transcript_segments) > 0
+            if status_code != 200 or (not transcript_text and not has_segments):
+                label = payload.get("detail") if isinstance(payload, dict) else None
+                if not label:
+                    label = payload.get("error") if isinstance(payload, dict) else None
+                if not label:
+                    label = payload.get("raw") if isinstance(payload, dict) else "Worker transcript unavailable"
+                raise RuntimeError(f"worker_error: {label}")
+
+            transcript = {
+                "url": source["url"],
+                "video_id": payload.get("video_id") or video_key,
+                "method": payload.get("method", "worker"),
+                "language": payload.get("language"),
+                "segments": transcript_segments or [],
+                "full_text": transcript_text,
+                "diagnostics": diagnostics,
+                "worker_status_code": status_code,
+            }
             transcript["source"] = source
-            diagnostics = transcript.get("diagnostics", {})
-            video_diagnostics.append({"video_id": video_key, **diagnostics})
             _log(video_key, f"Transcript method used: {transcript.get('method')}")
             _log(video_key, f"Transcript diagnostics: {json.dumps(diagnostics, ensure_ascii=False)}")
-        except TranscriptionError as exc:
-            failed_sources += 1
-            diagnostics = getattr(exc, "diagnostics", {}) or {}
-            video_diagnostics.append({"video_id": video_key, **diagnostics})
-            if exc.code == "transcript_unavailable_disabled":
-                label = "transcript_unavailable_yta; transcript_unavailable_timedtext (audio fallback disabled)"
-            elif exc.code in {"audio_fallback_failed", "audio_fallback_requires_openai_key"}:
-                label = str(exc)
-            else:
-                label = f"{exc.code}: {exc}"
-            err = f"transcription:{video_key} {label}"
-            runtime_errors.append(err)
-            per_video_errors.append(f"{video_key}: {label}")
-            _log(video_key, f"Transcript failed: {label}")
-            _log(video_key, f"Transcript diagnostics: {json.dumps(diagnostics, ensure_ascii=False)}")
-            continue
         except Exception as exc:
             failed_sources += 1
             err = f"transcription:{video_key} {exc}"
@@ -269,7 +314,6 @@ if st.button("Generate Brain Pack", type="primary"):
             "worker_url": worker_url or None,
         },
         "errors": runtime_errors,
-        "yta_runtime": yta_runtime,
         "video_diagnostics": video_diagnostics,
         "env": {
             "python_version": platform.python_version(),
@@ -317,7 +361,15 @@ if st.button("Generate Brain Pack", type="primary"):
             st.write(f"- {err}")
 
     with st.expander("Transcript diagnostics", expanded=False):
-        st.json({"yta_runtime": yta_runtime, "video_diagnostics": video_diagnostics})
+        st.json(
+            {
+                "worker_url_present": bool(worker_url),
+                "worker_api_key_present": bool((worker_api_key or "").strip()),
+                "worker_api_key_stripped_length": len((worker_api_key or "").strip()),
+                "worker_api_key_last4": (worker_api_key or "").strip()[-4:] if len((worker_api_key or "").strip()) >= 4 else "",
+                "video_diagnostics": video_diagnostics,
+            }
+        )
 
     if validation_errors:
         st.error("Validation failed. Brain Pack was not written.")
