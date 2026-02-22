@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import os
+import subprocess
 from dataclasses import dataclass
 from typing import Any
 
@@ -17,6 +19,13 @@ class DiscoveryError(Exception):
 
     def __str__(self) -> str:
         return f"{self.code}: {self.message}"
+
+
+@dataclass
+class DiscoveryOutcome:
+    candidates: list[dict[str, Any]]
+    method: str
+    youtube_api_http_status: int | None = None
 
 
 def _parse_iso8601_duration(duration: str) -> int | None:
@@ -54,17 +63,14 @@ def _score_candidate(item: dict[str, Any]) -> float:
     return float(view_count)
 
 
-def discover_youtube_videos(
+def _discover_via_youtube_api(
     keyword: str,
     max_candidates: int,
     published_after: str | None,
     language: str | None,
-    order: str = "relevance",
-) -> list[dict[str, Any]]:
-    api_key = (os.getenv("YOUTUBE_API_KEY") or "").strip()
-    if not api_key:
-        raise DiscoveryError("DISCOVERY_API_KEY_MISSING", "YOUTUBE_API_KEY is not configured")
-
+    order: str,
+    api_key: str,
+) -> DiscoveryOutcome:
     max_results = max(1, min(int(max_candidates), 50))
     search_params: dict[str, Any] = {
         "part": "snippet",
@@ -96,7 +102,7 @@ def discover_youtube_videos(
         if item.get("id", {}).get("videoId")
     ]
     if not video_ids:
-        return []
+        return DiscoveryOutcome(candidates=[], method="youtube_api", youtube_api_http_status=search_resp.status_code)
 
     try:
         details_resp = requests.get(
@@ -140,4 +146,58 @@ def discover_youtube_videos(
                 "score": _score_candidate(item),
             }
         )
-    return candidates
+    return DiscoveryOutcome(candidates=candidates, method="youtube_api", youtube_api_http_status=details_resp.status_code)
+
+
+def _discover_via_fallback(keyword: str, max_candidates: int) -> DiscoveryOutcome:
+    limit = max(1, min(int(max_candidates), 25))
+    cmd = [
+        "yt-dlp",
+        f"ytsearch{limit}:{keyword}",
+        "--skip-download",
+        "--flat-playlist",
+        "--dump-json",
+    ]
+    try:
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+        raise DiscoveryError("DISCOVERY_FALLBACK_FAILED", f"Fallback discovery failed: {exc}") from exc
+
+    candidates: list[dict[str, Any]] = []
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        video_id = payload.get("id")
+        if not video_id:
+            continue
+        candidates.append(
+            {
+                "video_id": video_id,
+                "title": payload.get("title", "Untitled Video"),
+                "channel_title": payload.get("channel", "Unknown Channel"),
+                "published_at": None,
+                "description": payload.get("description", ""),
+                "url": payload.get("webpage_url") or f"https://www.youtube.com/watch?v={video_id}",
+                "source": "fallback_ytdlp",
+                "score": 0,
+            }
+        )
+    return DiscoveryOutcome(candidates=candidates, method="fallback", youtube_api_http_status=None)
+
+
+def discover_youtube_videos(
+    keyword: str,
+    max_candidates: int,
+    published_after: str | None,
+    language: str | None,
+    order: str = "relevance",
+) -> DiscoveryOutcome:
+    api_key = (os.getenv("YOUTUBE_API_KEY") or "").strip()
+    if api_key:
+        return _discover_via_youtube_api(keyword, max_candidates, published_after, language, order, api_key)
+    return _discover_via_fallback(keyword, max_candidates)

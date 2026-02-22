@@ -34,7 +34,11 @@ def _wait_for_terminal_run(client: TestClient, run_id: str) -> dict:
 
 def test_ingest_zero_discovery_results_marks_error(monkeypatch, tmp_path):
     module = _load_module(monkeypatch, tmp_path)
-    monkeypatch.setattr(module, "discover_youtube_videos", lambda **kwargs: [])
+    monkeypatch.setattr(
+        module,
+        "discover_youtube_videos",
+        lambda **kwargs: module.DiscoveryOutcome(candidates=[], method="youtube_api", youtube_api_http_status=200),
+    )
 
     with TestClient(module.app) as client:
         create = client.post(
@@ -52,8 +56,10 @@ def test_ingest_zero_discovery_results_marks_error(monkeypatch, tmp_path):
         run = _wait_for_terminal_run(client, start.json()["run_id"])
 
     assert run["status"] == "completed_with_errors"
-    assert run["final_error_code"] == "DISCOVERY_ZERO_RESULTS"
     assert run["candidates_found"] == 0
+
+    run_json = module.load_json(module.BRAINS_ROOT / brain_id / "runs" / start.json()["run_id"] / "run.json", {})
+    assert run_json["final_error_code"] == "DISCOVERY_ZERO_RESULTS"
 
 
 def test_ingest_all_duplicates_completes_cleanly(monkeypatch, tmp_path):
@@ -61,15 +67,19 @@ def test_ingest_all_duplicates_completes_cleanly(monkeypatch, tmp_path):
     monkeypatch.setattr(
         module,
         "discover_youtube_videos",
-        lambda **kwargs: [
-            {
-                "video_id": "dup1",
-                "title": "Duplicate",
-                "channel_title": "Ch",
-                "published_at": "2024-01-01T00:00:00Z",
-                "url": "https://www.youtube.com/watch?v=dup1",
-            }
-        ],
+        lambda **kwargs: module.DiscoveryOutcome(
+            candidates=[
+                {
+                    "video_id": "dup1",
+                    "title": "Duplicate",
+                    "channel_title": "Ch",
+                    "published_at": "2024-01-01T00:00:00Z",
+                    "url": "https://www.youtube.com/watch?v=dup1",
+                }
+            ],
+            method="youtube_api",
+            youtube_api_http_status=200,
+        ),
     )
 
     with TestClient(module.app) as client:
@@ -92,4 +102,6 @@ def test_ingest_all_duplicates_completes_cleanly(monkeypatch, tmp_path):
 
     assert run["status"] == "completed"
     assert run["selected_new"] == 0
-    assert run["message"] == "No new videos; all candidates already ingested"
+
+    run_json = module.load_json(module.BRAINS_ROOT / brain_id / "runs" / start.json()["run_id"] / "run.json", {})
+    assert run_json["message"] == "No new videos; all candidates already ingested"
