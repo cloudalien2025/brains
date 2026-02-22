@@ -626,6 +626,7 @@ def get_transcript_from_worker(
             "source_id": f"yt:{_video_id_from_url(source['url'])}",
             "url": source["url"],
             "preferred_langs": prefer_lang or ["en", "en-US", "en-GB"],
+            "allow_audio_fallback": bool(allow_audio_fallback),
         },
         timeout=60,
     )
