@@ -6,3 +6,4 @@ yt-dlp
 faster-whisper
 ctranslate2
 openai
+playwright

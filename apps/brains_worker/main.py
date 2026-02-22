@@ -30,6 +30,10 @@ HTTPStatusValue = int | str
 
 # Hard limit for yt-dlp subtitle extraction so the worker can respond within Streamlit's 30s timeout.
 YTDLP_SUBS_TIMEOUT_S = int(os.getenv("BRAINS_YTDLP_SUBS_TIMEOUT_S", "12"))
+YT_COOKIES_PATH = Path(os.getenv("BRAINS_YTDLP_COOKIES_PATH", "/opt/brains-worker/cookies/youtube_cookies.txt"))
+YT_COOKIE_MAX_AGE_S = int(os.getenv("BRAINS_YTDLP_COOKIES_MAX_AGE_S", str(12 * 60 * 60)))
+YT_COOKIE_BOOTSTRAP_TIMEOUT_S = int(os.getenv("BRAINS_YTDLP_COOKIE_BOOTSTRAP_TIMEOUT_S", "12"))
+YT_COOKIE_BOOTSTRAP_SCRIPT = Path(os.getenv("BRAINS_YTDLP_COOKIE_BOOTSTRAP_SCRIPT", "tools/bootstrap_youtube_cookies.py"))
 
 
 class TranscriptRequest(BaseModel):
@@ -90,7 +94,73 @@ def _redact_ytdlp_stderr(stderr: str | None, limit: int = 500) -> str:
         return ""
     redacted = re.sub(r"(https?://)([^\s/@:]+):([^\s/@]+)@", r"\1***:***@", stderr)
     redacted = re.sub(r"(?i)(signature|sig|sparams|lsig|key|expire|token)=([^&\s]+)", r"\1=<redacted>", redacted)
+    redacted = redacted.replace(str(YT_COOKIES_PATH), "<cookies_path>")
     return _sanitize_sniff(redacted, limit)
+
+
+def _cookie_file_age_seconds(path: Path) -> int | None:
+    if not path.exists():
+        return None
+    try:
+        return max(0, int(time.time() - path.stat().st_mtime))
+    except Exception:
+        return None
+
+
+def _cookie_count(path: Path) -> int:
+    if not path.exists():
+        return 0
+    try:
+        count = 0
+        for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#"):
+                count += 1
+        return count
+    except Exception:
+        return 0
+
+
+def _ensure_youtube_cookies() -> dict[str, Any]:
+    diag = {
+        "cookies_present": YT_COOKIES_PATH.exists(),
+        "cookies_age_seconds": _cookie_file_age_seconds(YT_COOKIES_PATH),
+        "cookies_bootstrap_attempted": False,
+        "cookies_bootstrap_status": "skipped",
+        "cookies_bootstrap_elapsed_ms": 0,
+        "cookies_cookie_count": _cookie_count(YT_COOKIES_PATH),
+    }
+
+    stale = (diag["cookies_age_seconds"] is None) or (diag["cookies_age_seconds"] > YT_COOKIE_MAX_AGE_S)
+    if not stale:
+        return diag
+
+    script = YT_COOKIE_BOOTSTRAP_SCRIPT
+    if not script.is_absolute():
+        script = Path(__file__).resolve().parents[2] / script
+    if not script.exists():
+        return diag
+
+    diag["cookies_bootstrap_attempted"] = True
+    started = time.perf_counter()
+    try:
+        proc = subprocess.run(
+            ["python", str(script), "--output", str(YT_COOKIES_PATH)],
+            capture_output=True,
+            text=True,
+            timeout=YT_COOKIE_BOOTSTRAP_TIMEOUT_S,
+        )
+        diag["cookies_bootstrap_status"] = "success" if proc.returncode == 0 else "failed"
+    except subprocess.TimeoutExpired:
+        diag["cookies_bootstrap_status"] = "timeout"
+    except Exception:
+        diag["cookies_bootstrap_status"] = "failed"
+
+    diag["cookies_bootstrap_elapsed_ms"] = int((time.perf_counter() - started) * 1000)
+    diag["cookies_present"] = YT_COOKIES_PATH.exists()
+    diag["cookies_age_seconds"] = _cookie_file_age_seconds(YT_COOKIES_PATH)
+    diag["cookies_cookie_count"] = _cookie_count(YT_COOKIES_PATH)
+    return diag
 
 
 def _build_caption_url_fmt(track: dict[str, Any], fmt: str = "vtt") -> str:
@@ -391,7 +461,7 @@ def _download_text(url: str, proxy: str | None) -> tuple[HTTPStatusValue, str | 
         return "exception", None, None
 
 
-def _run_ytdlp_subtitles(youtube_url: str, preferred_language: str | None, proxy: str | None, work_dir: Path) -> tuple[str | None, dict[str, Any]]:
+def _run_ytdlp_subtitles(youtube_url: str, preferred_language: str | None, proxy: str | None, work_dir: Path, cookies_path: Path | None = None) -> tuple[str | None, dict[str, Any]]:
     start = time.perf_counter()
     diag = {
         "ytdlp_subs_status": "failed",
@@ -402,6 +472,7 @@ def _run_ytdlp_subtitles(youtube_url: str, preferred_language: str | None, proxy
         "ytdlp_subs_file_bytes": 0,
         "ytdlp_subs_file_path": None,
         "ytdlp_subs_stderr_sniff": None,
+        "ytdlp_used_cookies": False,
     }
 
     yt_dlp = shutil.which("yt-dlp")
@@ -410,7 +481,8 @@ def _run_ytdlp_subtitles(youtube_url: str, preferred_language: str | None, proxy
         diag["ytdlp_subs_elapsed_ms"] = int((time.perf_counter() - start) * 1000)
         return None, diag
 
-    langs = ",".join([p for p in [preferred_language, "en.*"] if p])
+    preferred = (preferred_language or "").strip()
+    langs = [part for part in [preferred, "en.*", "en"] if part]
 
     cmd = [
         yt_dlp,
@@ -418,10 +490,9 @@ def _run_ytdlp_subtitles(youtube_url: str, preferred_language: str | None, proxy
         "--write-subs",
         "--write-auto-subs",
         "--sub-langs",
-        langs or "en.*",
+        ",".join(langs),
         "--sub-format",
         "vtt/srt/ttml/best",
-        # Force fast-fail behavior under gating/proxy issues
         "--retries",
         "1",
         "--fragment-retries",
@@ -434,6 +505,10 @@ def _run_ytdlp_subtitles(youtube_url: str, preferred_language: str | None, proxy
         str(work_dir / "%(id)s.%(ext)s"),
         youtube_url,
     ]
+
+    if cookies_path and cookies_path.exists():
+        cmd.extend(["--cookies", str(cookies_path)])
+        diag["ytdlp_used_cookies"] = True
 
     if proxy:
         cmd.extend(["--proxy", proxy])
@@ -451,25 +526,39 @@ def _run_ytdlp_subtitles(youtube_url: str, preferred_language: str | None, proxy
         return None, diag
 
     diag["ytdlp_subs_elapsed_ms"] = int((time.perf_counter() - start) * 1000)
+    stderr_sniff = _redact_ytdlp_stderr(proc.stderr)
+    if stderr_sniff:
+        diag["ytdlp_subs_stderr_sniff"] = stderr_sniff
 
-    if proc.returncode != 0:
-        diag["ytdlp_subs_error_code"] = "YTDLP_SUBS_FAILED"
-        diag["ytdlp_subs_stderr_sniff"] = _redact_ytdlp_stderr(proc.stderr)
-        return None, diag
+    stderr_lc = (proc.stderr or "").lower()
+    blocked_markers = ["sign in to confirm", "consent", "429", "too many requests"]
 
     files = [p for p in work_dir.glob("*.*") if p.suffix.lower().lstrip(".") in {"vtt", "srt", "ttml"}]
+    if proc.returncode != 0 and not files:
+        if any(marker in stderr_lc for marker in blocked_markers):
+            diag["ytdlp_subs_status"] = "blocked"
+            diag["ytdlp_subs_error_code"] = "YTDLP_BLOCKED"
+        elif "subtitle" in stderr_lc and any(marker in stderr_lc for marker in ["not available", "no subtitles", "there are no subtitles"]):
+            diag["ytdlp_subs_status"] = "no_subs"
+            diag["ytdlp_subs_error_code"] = "NO_SUBTITLE_FILES"
+        else:
+            diag["ytdlp_subs_error_code"] = "YTDLP_SUBS_FAILED"
+        return None, diag
+
     if not files:
+        diag["ytdlp_subs_status"] = "no_subs"
         diag["ytdlp_subs_error_code"] = "NO_SUBTITLE_FILES"
         return None, diag
 
-    pref = (preferred_language or "").lower()
+    pref = preferred.lower()
 
-    def score(path: Path) -> tuple[int, int, int]:
+    def score(path: Path) -> tuple[int, int, int, int]:
         name = path.name.lower()
         auto = 1 if ".live_chat." in name or ".asr." in name else 0
-        lang_match = 0 if pref and f".{pref}" in name else 1
+        lang_match = 0 if pref and (f".{pref}." in f".{name}." or f".{pref}-" in name) else 1
         english = 0 if ".en" in name else 1
-        return auto, lang_match, english
+        size_rank = -path.stat().st_size
+        return lang_match, english, auto, size_rank
 
     selected = sorted(files, key=score)[0]
     text = _parse_subtitle_to_text(
@@ -642,6 +731,13 @@ def _base_diagnostics(video_id: str, payload: TranscriptRequest, proxy_enabled: 
         "ytdlp_subs_file_bytes": 0,
         "ytdlp_subs_file_path": None,
         "ytdlp_subs_stderr_sniff": None,
+        "ytdlp_used_cookies": False,
+        "cookies_present": False,
+        "cookies_age_seconds": None,
+        "cookies_bootstrap_attempted": False,
+        "cookies_bootstrap_status": "skipped",
+        "cookies_bootstrap_elapsed_ms": 0,
+        "cookies_cookie_count": 0,
         "audio_fallback_enabled": payload.audio_fallback_enabled if payload.allow_audio_fallback is None else payload.allow_audio_fallback,
         "audio_fallback_attempted": False,
         "audio_download_status": "skipped",
@@ -675,13 +771,6 @@ def transcript_version() -> dict[str, Any]:
 
 @app.post("/transcript")
 def transcript(payload: TranscriptRequest, x_api_key: str | None = Header(default=None, alias="x-api-key"), x_api_key_2: str | None = Header(default=None, alias="X-Api-Key")) -> Any:
-    # Manual validation plan for fast-fail + robust captions:
-    # 1) Pick a video with known auto-generated captions.
-    # 2) POST /transcript with audio_fallback_enabled=false.
-    # 3) Confirm response completes in <30s.
-    # 4) Confirm transcript_source="captions_player_json" and caption_parse_status="success".
-    # 5) Test a video with no captions and verify yt-dlp times out in ~BRAINS_YTDLP_SUBS_TIMEOUT_S,
-    #    then returns 422 NO_CAPTIONS_AND_FALLBACK_DISABLED (not 502) when fallback disabled.
     expected_key = _expected_api_key()
     provided = (x_api_key or x_api_key_2 or "").strip()
     if expected_key and provided != expected_key:
@@ -706,83 +795,88 @@ def transcript(payload: TranscriptRequest, x_api_key: str | None = Header(defaul
     temp_root.mkdir(parents=True, exist_ok=True)
     work_dir = Path(tempfile.mkdtemp(prefix=f"{canonical_id}-", dir=str(temp_root)))
 
-    try:
-        if payload.captions_enabled:
-            diagnostics["pipeline_stage_attempts"].append("captions_player_json")
-            diagnostics["player_json_attempted"] = True
-            status, player, player_err = _youtube_watch_player_json(canonical_id, proxy_url)
-            diagnostics["player_json_http_status"] = status
-            diagnostics["player_json_error_code"] = player_err
-
-            tracks = ((player or {}).get("captions") or {}).get("playerCaptionsTracklistRenderer", {}).get("captionTracks", [])
-            diagnostics["caption_tracks_found"] = len(tracks)
-
-            if tracks:
-                best = _choose_caption_track(tracks, preferred_language)
-                if best:
-                    diagnostics["caption_best_track"] = {
-                        "lang": best.get("languageCode"),
-                        "kind": best.get("kind"),
-                        "name": ((best.get("name") or {}).get("simpleText") if isinstance(best.get("name"), dict) else best.get("name")),
-                    }
-                    base_url = best.get("baseUrl")
-                    if base_url:
-                        sep = "&" if "?" in base_url else "?"
-                        caption_url = f"{base_url}{sep}fmt=vtt"
-                        diagnostics["caption_download_url_fmt"] = _build_caption_url_fmt(best, fmt="vtt")
-                        cap_status, cap_body, cap_content_type = _download_text(caption_url, proxy_url)
-                        diagnostics["caption_download_http_status"] = cap_status
-                        diagnostics["caption_content_type"] = cap_content_type
-                        diagnostics["caption_body_chars"] = len(cap_body or "")
-                        diagnostics["caption_sniff"] = _sanitize_sniff(cap_body, 800)
-                        diagnostics["caption_sniff_hint"] = _classify_caption_sniff(diagnostics["caption_sniff"])
-                        if cap_body:
-                            parsed = ""
-                            diagnostics["caption_parse_error"] = None
-                            try:
-                                parsed = _parse_subtitle_to_text(cap_body, "vtt")
-                            except Exception as exc:
-                                diagnostics["caption_parse_error"] = f"{type(exc).__name__}: {exc}"
-
-                            hint = diagnostics["caption_sniff_hint"]
-                            if not parsed or hint in {"XML", "JSON", "HTML"}:
-                                try:
-                                    if hint == "XML":
-                                        xml_parsed = _parse_subtitle_to_text(cap_body, "xml")
-                                        if xml_parsed:
-                                            parsed = xml_parsed
-                                    elif hint == "JSON":
-                                        json_parsed = _parse_json3_subtitle_to_text(cap_body)
-                                        if json_parsed:
-                                            parsed = json_parsed
-                                    elif hint == "HTML":
-                                        diagnostics["caption_parse_status"] = "blocked_html"
-                                except Exception as exc:
-                                    diagnostics["caption_parse_error"] = f"{type(exc).__name__}: {exc}"
-
-                            if parsed:
-                                diagnostics["caption_parse_status"] = "success"
-                                diagnostics["caption_chars"] = len(parsed)
-                                diagnostics["pipeline_stage_success"] = "captions_player_json"
-                                diagnostics["transcript_chars"] = len(parsed)
-                                diagnostics["ytdlp_subs_attempted"] = False
-                                diagnostics["ytdlp_subs_status"] = "skipped_due_to_captions"
-                                diagnostics["elapsed_ms_total"] = int((time.perf_counter() - started) * 1000)
-                                return {"video_id": canonical_id, "transcript_source": "captions_player_json", "transcript_text": parsed, "diagnostics": diagnostics}
-                            if diagnostics["caption_parse_status"] != "blocked_html":
-                                diagnostics["caption_parse_status"] = "failed"
-                        else:
-                            diagnostics["caption_parse_status"] = "failed"
-
-            if diagnostics["caption_parse_status"] == "skipped" and diagnostics["caption_tracks_found"] == 0:
-                diagnostics["caption_download_http_status"] = "exception"
-        else:
+    def _attempt_player_json_captions() -> str | None:
+        if not payload.captions_enabled:
             diagnostics["caption_parse_status"] = "skipped"
+            return None
+
+        diagnostics["pipeline_stage_attempts"].append("captions_player_json")
+        diagnostics["player_json_attempted"] = True
+        status, player, player_err = _youtube_watch_player_json(canonical_id, proxy_url)
+        diagnostics["player_json_http_status"] = status
+        diagnostics["player_json_error_code"] = player_err
+
+        tracks = ((player or {}).get("captions") or {}).get("playerCaptionsTracklistRenderer", {}).get("captionTracks", [])
+        diagnostics["caption_tracks_found"] = len(tracks)
+
+        if not tracks:
+            diagnostics["caption_download_http_status"] = "exception"
+            return None
+
+        best = _choose_caption_track(tracks, preferred_language)
+        if not best:
+            return None
+
+        diagnostics["caption_best_track"] = {
+            "lang": best.get("languageCode"),
+            "kind": best.get("kind"),
+            "name": ((best.get("name") or {}).get("simpleText") if isinstance(best.get("name"), dict) else best.get("name")),
+        }
+        base_url = best.get("baseUrl")
+        if not base_url:
+            diagnostics["caption_parse_status"] = "failed"
+            return None
+
+        sep = "&" if "?" in base_url else "?"
+        caption_url = f"{base_url}{sep}fmt=vtt"
+        diagnostics["caption_download_url_fmt"] = _build_caption_url_fmt(best, fmt="vtt")
+        cap_status, cap_body, cap_content_type = _download_text(caption_url, proxy_url)
+        diagnostics["caption_download_http_status"] = cap_status
+        diagnostics["caption_content_type"] = cap_content_type
+        diagnostics["caption_body_chars"] = len(cap_body or "")
+        diagnostics["caption_sniff"] = _sanitize_sniff(cap_body, 800)
+        diagnostics["caption_sniff_hint"] = _classify_caption_sniff(diagnostics["caption_sniff"])
+
+        if not cap_body:
+            diagnostics["caption_parse_status"] = "failed"
+            return None
+
+        parsed = ""
+        diagnostics["caption_parse_error"] = None
+        try:
+            parsed = _parse_subtitle_to_text(cap_body, "vtt")
+        except Exception as exc:
+            diagnostics["caption_parse_error"] = f"{type(exc).__name__}: {exc}"
+
+        hint = diagnostics["caption_sniff_hint"]
+        if not parsed or hint in {"XML", "JSON", "HTML"}:
+            try:
+                if hint == "XML":
+                    parsed = _parse_subtitle_to_text(cap_body, "xml") or parsed
+                elif hint == "JSON":
+                    parsed = _parse_json3_subtitle_to_text(cap_body) or parsed
+                elif hint == "HTML":
+                    diagnostics["caption_parse_status"] = "blocked_html"
+            except Exception as exc:
+                diagnostics["caption_parse_error"] = f"{type(exc).__name__}: {exc}"
+
+        if parsed:
+            diagnostics["caption_parse_status"] = "success"
+            diagnostics["caption_chars"] = len(parsed)
+            return parsed
+
+        if diagnostics["caption_parse_status"] != "blocked_html":
+            diagnostics["caption_parse_status"] = "failed"
+        return None
+
+    try:
+        cookie_diag = _ensure_youtube_cookies()
+        diagnostics.update(cookie_diag)
 
         if payload.yt_dlp_subs_enabled:
             diagnostics["pipeline_stage_attempts"].append("subs_ytdlp")
             diagnostics["ytdlp_subs_attempted"] = True
-            text, diag = _run_ytdlp_subtitles(youtube_url, preferred_language, proxy_url, work_dir)
+            text, diag = _run_ytdlp_subtitles(youtube_url, preferred_language, proxy_url, work_dir, YT_COOKIES_PATH if diagnostics["cookies_present"] else None)
             diagnostics.update(diag)
             if payload.debug_include_artifact_paths is False:
                 diagnostics["ytdlp_subs_file_path"] = None
@@ -793,7 +887,13 @@ def transcript(payload: TranscriptRequest, x_api_key: str | None = Header(defaul
                 diagnostics["elapsed_ms_total"] = int((time.perf_counter() - started) * 1000)
                 return {"video_id": canonical_id, "transcript_source": "subs_ytdlp", "transcript_text": text, "diagnostics": diagnostics}
 
-        # If we reach here: no captions/subtitles were produced.
+        caption_text = _attempt_player_json_captions()
+        if caption_text:
+            diagnostics["pipeline_stage_success"] = "captions_player_json"
+            diagnostics["transcript_chars"] = len(caption_text)
+            diagnostics["elapsed_ms_total"] = int((time.perf_counter() - started) * 1000)
+            return {"video_id": canonical_id, "transcript_source": "captions_player_json", "transcript_text": caption_text, "diagnostics": diagnostics}
+
         if not fallback_enabled:
             diagnostics["elapsed_ms_total"] = int((time.perf_counter() - started) * 1000)
             return _error(422, "NO_CAPTIONS_AND_FALLBACK_DISABLED", "No captions/subtitles found and audio fallback disabled", diagnostics)
@@ -829,3 +929,4 @@ def transcript(payload: TranscriptRequest, x_api_key: str | None = Header(defaul
     finally:
         if not payload.debug_keep_files:
             shutil.rmtree(work_dir, ignore_errors=True)
+

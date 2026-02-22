@@ -15,7 +15,7 @@ def test_worker_import_without_openai_key(monkeypatch):
     assert hasattr(module, "app")
 
 
-def test_stage1_player_json_success(monkeypatch):
+def test_stage1_player_json_secondary_success(monkeypatch):
     monkeypatch.setenv("BRAINS_API_KEY", "test-key")
     from apps.brains_worker.main import app
 
@@ -41,14 +41,30 @@ def test_stage1_player_json_success(monkeypatch):
     monkeypatch.setattr("apps.brains_worker.main._youtube_watch_player_json", fake_player)
     monkeypatch.setattr("apps.brains_worker.main._download_text", fake_download)
 
+
+    monkeypatch.setattr(
+        "apps.brains_worker.main._run_ytdlp_subtitles",
+        lambda *args, **kwargs: (None, {
+            "ytdlp_subs_status": "no_subs",
+            "ytdlp_subs_error_code": "NO_SUBTITLE_FILES",
+            "ytdlp_subs_elapsed_ms": 1,
+            "ytdlp_subs_lang": None,
+            "ytdlp_subs_format": None,
+            "ytdlp_subs_file_bytes": 0,
+            "ytdlp_subs_file_path": None,
+            "ytdlp_subs_stderr_sniff": None,
+            "ytdlp_used_cookies": False,
+        }),
+    )
+
     client = TestClient(app)
     response = client.post("/transcript", headers={"x-api-key": "test-key"}, json={"video_id": "5lQf89-AeFo"})
     assert response.status_code == 200
     payload = response.json()
     assert payload["transcript_source"] == "captions_player_json"
     assert "hello stage one" in payload["transcript_text"]
-    assert payload["diagnostics"]["ytdlp_subs_attempted"] is False
-    assert payload["diagnostics"]["ytdlp_subs_status"] == "skipped_due_to_captions"
+    assert payload["diagnostics"]["ytdlp_subs_attempted"] is True
+    assert payload["diagnostics"]["ytdlp_subs_status"] == "no_subs"
 
 
 def test_caption_json3_retry_parse(monkeypatch):
@@ -77,6 +93,22 @@ def test_caption_json3_retry_parse(monkeypatch):
     monkeypatch.setattr("apps.brains_worker.main._youtube_watch_player_json", fake_player)
     monkeypatch.setattr("apps.brains_worker.main._download_text", fake_download)
 
+
+    monkeypatch.setattr(
+        "apps.brains_worker.main._run_ytdlp_subtitles",
+        lambda *args, **kwargs: (None, {
+            "ytdlp_subs_status": "no_subs",
+            "ytdlp_subs_error_code": "NO_SUBTITLE_FILES",
+            "ytdlp_subs_elapsed_ms": 1,
+            "ytdlp_subs_lang": None,
+            "ytdlp_subs_format": None,
+            "ytdlp_subs_file_bytes": 0,
+            "ytdlp_subs_file_path": None,
+            "ytdlp_subs_stderr_sniff": None,
+            "ytdlp_used_cookies": False,
+        }),
+    )
+
     client = TestClient(app)
     response = client.post("/transcript", headers={"x-api-key": "test-key"}, json={"video_id": "5lQf89-AeFo"})
     assert response.status_code == 200
@@ -92,7 +124,7 @@ def test_stage2_ytdlp_subs_success(monkeypatch):
     def fake_player(video_id: str, proxy: str | None):
         return 200, {}, None
 
-    def fake_subs(youtube_url: str, preferred_language: str | None, proxy: str | None, work_dir: Path):
+    def fake_subs(youtube_url: str, preferred_language: str | None, proxy: str | None, work_dir: Path, cookies_path: Path | None = None):
         return "hello stage two", {
             "ytdlp_subs_status": "success",
             "ytdlp_subs_error_code": None,
@@ -101,6 +133,8 @@ def test_stage2_ytdlp_subs_success(monkeypatch):
             "ytdlp_subs_format": "vtt",
             "ytdlp_subs_file_bytes": 10,
             "ytdlp_subs_file_path": str(work_dir / "x.en.vtt"),
+            "ytdlp_subs_stderr_sniff": None,
+            "ytdlp_used_cookies": False,
         }
 
     monkeypatch.setattr("apps.brains_worker.main._youtube_watch_player_json", fake_player)
@@ -120,7 +154,7 @@ def test_stage3_audio_openai_success(monkeypatch):
     def fake_player(video_id: str, proxy: str | None):
         return 200, {}, None
 
-    def fake_subs(youtube_url: str, preferred_language: str | None, proxy: str | None, work_dir: Path):
+    def fake_subs(youtube_url: str, preferred_language: str | None, proxy: str | None, work_dir: Path, cookies_path: Path | None = None):
         return None, {
             "ytdlp_subs_status": "failed",
             "ytdlp_subs_error_code": "NO_SUBTITLE_FILES",
@@ -129,6 +163,8 @@ def test_stage3_audio_openai_success(monkeypatch):
             "ytdlp_subs_format": None,
             "ytdlp_subs_file_bytes": 0,
             "ytdlp_subs_file_path": None,
+            "ytdlp_subs_stderr_sniff": None,
+            "ytdlp_used_cookies": False,
         }
 
     def fake_audio(youtube_url: str, proxy: str | None, work_dir: Path):
