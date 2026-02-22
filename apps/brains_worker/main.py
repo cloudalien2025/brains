@@ -471,6 +471,7 @@ def _run_ytdlp_subtitles(youtube_url: str, preferred_language: str | None, proxy
         "ytdlp_subs_format": None,
         "ytdlp_subs_file_bytes": 0,
         "ytdlp_subs_file_path": None,
+        "ytdlp_subs_sniff": None,
         "ytdlp_subs_stderr_sniff": None,
         "ytdlp_used_cookies": False,
     }
@@ -481,8 +482,10 @@ def _run_ytdlp_subtitles(youtube_url: str, preferred_language: str | None, proxy
         diag["ytdlp_subs_elapsed_ms"] = int((time.perf_counter() - start) * 1000)
         return None, diag
 
-    preferred = (preferred_language or "").strip()
+    preferred = (preferred_language or "").strip().lower()
     langs = [part for part in [preferred, "en.*", "en"] if part]
+    canonical_id = _extract_video_id("", youtube_url, youtube_url)
+    output_template = "/tmp/%(id)s.%(ext)s"
 
     cmd = [
         yt_dlp,
@@ -492,7 +495,8 @@ def _run_ytdlp_subtitles(youtube_url: str, preferred_language: str | None, proxy
         "--sub-langs",
         ",".join(langs),
         "--sub-format",
-        "vtt/srt/ttml/best",
+        "vtt",
+        "--ignore-no-formats-error",
         "--retries",
         "1",
         "--fragment-retries",
@@ -502,7 +506,7 @@ def _run_ytdlp_subtitles(youtube_url: str, preferred_language: str | None, proxy
         "--socket-timeout",
         "10",
         "-o",
-        str(work_dir / "%(id)s.%(ext)s"),
+        output_template,
         youtube_url,
     ]
 
@@ -533,7 +537,7 @@ def _run_ytdlp_subtitles(youtube_url: str, preferred_language: str | None, proxy
     stderr_lc = (proc.stderr or "").lower()
     blocked_markers = ["sign in to confirm", "consent", "429", "too many requests"]
 
-    files = [p for p in work_dir.glob("*.*") if p.suffix.lower().lstrip(".") in {"vtt", "srt", "ttml"}]
+    files = [p for p in Path("/tmp").glob(f"{canonical_id}*.vtt") if p.exists() and p.stat().st_size > 0] if canonical_id else []
     if proc.returncode != 0 and not files:
         if any(marker in stderr_lc for marker in blocked_markers):
             diag["ytdlp_subs_status"] = "blocked"
@@ -550,17 +554,13 @@ def _run_ytdlp_subtitles(youtube_url: str, preferred_language: str | None, proxy
         diag["ytdlp_subs_error_code"] = "NO_SUBTITLE_FILES"
         return None, diag
 
-    pref = preferred.lower()
+    preferred_files: list[Path] = []
+    if canonical_id:
+        preferred_files.extend(sorted(Path("/tmp").glob(f"{canonical_id}.en-orig.vtt")))
+        preferred_files.extend(sorted(Path("/tmp").glob(f"{canonical_id}.en.vtt")))
+        preferred_files.extend(sorted(Path("/tmp").glob(f"{canonical_id}.en-*.vtt")))
 
-    def score(path: Path) -> tuple[int, int, int, int]:
-        name = path.name.lower()
-        auto = 1 if ".live_chat." in name or ".asr." in name else 0
-        lang_match = 0 if pref and (f".{pref}." in f".{name}." or f".{pref}-" in name) else 1
-        english = 0 if ".en" in name else 1
-        size_rank = -path.stat().st_size
-        return lang_match, english, auto, size_rank
-
-    selected = sorted(files, key=score)[0]
+    selected = next((candidate for candidate in preferred_files if candidate.exists() and candidate.stat().st_size > 0), files[0])
     text = _parse_subtitle_to_text(
         selected.read_text(encoding="utf-8", errors="ignore"),
         selected.suffix.lower().lstrip("."),
@@ -575,6 +575,7 @@ def _run_ytdlp_subtitles(youtube_url: str, preferred_language: str | None, proxy
     diag["ytdlp_subs_lang"] = next((part for part in selected.stem.split(".") if len(part) in {2, 5} and part[:2].isalpha()), None)
     diag["ytdlp_subs_format"] = selected.suffix.lower().lstrip(".")
     diag["ytdlp_subs_file_path"] = str(selected)
+    diag["ytdlp_subs_sniff"] = _sanitize_sniff(selected.read_text(encoding="utf-8", errors="ignore"), 800)
 
     return text, diag
 
@@ -730,6 +731,7 @@ def _base_diagnostics(video_id: str, payload: TranscriptRequest, proxy_enabled: 
         "ytdlp_subs_format": None,
         "ytdlp_subs_file_bytes": 0,
         "ytdlp_subs_file_path": None,
+        "ytdlp_subs_sniff": None,
         "ytdlp_subs_stderr_sniff": None,
         "ytdlp_used_cookies": False,
         "cookies_present": False,
@@ -767,6 +769,34 @@ def health() -> dict[str, Any]:
 @app.get("/transcript/version")
 def transcript_version() -> dict[str, Any]:
     return _version_payload()
+
+
+@app.get("/transcript/subs-dry-run")
+def transcript_subs_dry_run(video_id: str) -> dict[str, Any]:
+    canonical_id = _extract_video_id(video_id, None, None)
+    if not canonical_id:
+        return {"ok": False, "error_code": "INVALID_VIDEO_ID", "video_id": video_id}
+
+    work_dir = Path(tempfile.mkdtemp(prefix=f"{canonical_id}-subs-", dir="/tmp"))
+    youtube_url = f"https://www.youtube.com/watch?v={canonical_id}"
+    try:
+        text, diag = _run_ytdlp_subtitles(
+            youtube_url,
+            "en",
+            None,
+            work_dir,
+            YT_COOKIES_PATH if YT_COOKIES_PATH.exists() else None,
+        )
+        return {
+            "ok": bool(text),
+            "video_id": canonical_id,
+            "transcript_chars": len(text or ""),
+            "ytdlp_subs_status": diag.get("ytdlp_subs_status"),
+            "ytdlp_subs_file_path": diag.get("ytdlp_subs_file_path"),
+            "ytdlp_subs_sniff": diag.get("ytdlp_subs_sniff"),
+        }
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 @app.post("/transcript")
@@ -929,4 +959,3 @@ def transcript(payload: TranscriptRequest, x_api_key: str | None = Header(defaul
     finally:
         if not payload.debug_keep_files:
             shutil.rmtree(work_dir, ignore_errors=True)
-

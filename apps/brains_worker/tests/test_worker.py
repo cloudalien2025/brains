@@ -281,3 +281,101 @@ def test_missing_openai_key_when_stt_needed(monkeypatch):
     )
     assert response.status_code == 500
     assert response.json()["error_code"] == "OPENAI_KEY_MISSING"
+
+
+def test_ytdlp_subs_nonzero_with_vtt_succeeds(monkeypatch, tmp_path):
+    from apps.brains_worker import main
+
+    monkeypatch.setattr(main.shutil, "which", lambda name: "/usr/bin/yt-dlp")
+
+    class Proc:
+        returncode = 1
+        stderr = "Requested format is not available"
+
+    subtitle = Path("/tmp/5MuIMqhT8DM.en.vtt")
+    if subtitle.exists():
+        subtitle.unlink()
+
+    def fake_run(cmd, capture_output, text, timeout):
+        subtitle.write_text("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nhello world", encoding="utf-8")
+        return Proc()
+
+    monkeypatch.setattr(main.subprocess, "run", fake_run)
+
+    transcript, diag = main._run_ytdlp_subtitles(
+        "https://www.youtube.com/watch?v=5MuIMqhT8DM",
+        "en",
+        None,
+        tmp_path,
+        Path("/does/not/exist"),
+    )
+
+    assert transcript == "hello world"
+    assert diag["ytdlp_subs_status"] == "success"
+    assert diag["ytdlp_subs_error_code"] is None
+    assert diag["ytdlp_subs_format"] == "vtt"
+    assert diag["ytdlp_subs_file_bytes"] > 0
+    assert diag["ytdlp_subs_file_path"].endswith("5MuIMqhT8DM.en.vtt")
+    subtitle.unlink(missing_ok=True)
+
+
+def test_ytdlp_subs_command_includes_subs_only_flags(monkeypatch, tmp_path):
+    from apps.brains_worker import main
+
+    monkeypatch.setattr(main.shutil, "which", lambda name: "/usr/bin/yt-dlp")
+
+    captured = {}
+
+    class Proc:
+        returncode = 0
+        stderr = ""
+
+    subtitle = Path("/tmp/5MuIMqhT8DM.en.vtt")
+    if subtitle.exists():
+        subtitle.unlink()
+
+    def fake_run(cmd, capture_output, text, timeout):
+        captured["cmd"] = cmd
+        subtitle.write_text("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nhello", encoding="utf-8")
+        return Proc()
+
+    monkeypatch.setattr(main.subprocess, "run", fake_run)
+
+    _, _ = main._run_ytdlp_subtitles(
+        "https://www.youtube.com/watch?v=5MuIMqhT8DM",
+        "en",
+        None,
+        tmp_path,
+        Path("/does/not/exist"),
+    )
+
+    cmd = captured["cmd"]
+    assert "--skip-download" in cmd
+    assert "--write-subs" in cmd
+    assert "--write-auto-subs" in cmd
+    assert "--ignore-no-formats-error" in cmd
+    assert "--sub-format" in cmd and cmd[cmd.index("--sub-format") + 1] == "vtt"
+    assert "-o" in cmd and cmd[cmd.index("-o") + 1] == "/tmp/%(id)s.%(ext)s"
+    subtitle.unlink(missing_ok=True)
+
+
+def test_subs_dry_run_endpoint(monkeypatch):
+    monkeypatch.setenv("BRAINS_API_KEY", "test-key")
+    from apps.brains_worker.main import app
+
+    monkeypatch.setattr(
+        "apps.brains_worker.main._run_ytdlp_subtitles",
+        lambda *args, **kwargs: ("hello dry run", {
+            "ytdlp_subs_status": "success",
+            "ytdlp_subs_file_path": "/tmp/abc.en.vtt",
+            "ytdlp_subs_sniff": "WEBVTT",
+        }),
+    )
+
+    client = TestClient(app)
+    response = client.get("/transcript/subs-dry-run", params={"video_id": "5MuIMqhT8DM"})
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["transcript_chars"] > 0
+    assert payload["ytdlp_subs_file_path"] == "/tmp/abc.en.vtt"
