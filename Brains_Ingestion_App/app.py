@@ -42,6 +42,7 @@ def _render_worker_http_error(response: requests.Response) -> None:
 st.set_page_config(page_title="Brains ingestion", layout="wide")
 st.title("Brains ingestion")
 st.caption("Select a Brain, ingest new videos by keyword, generate a Brain Pack.")
+st.caption("Discovery powered by YouTube Data API (server-side).")
 
 for key, default in {
     "brains": [],
@@ -210,7 +211,8 @@ if st.button("Discover + Ingest New Videos", type="primary", disabled=not worker
     else:
         ingest_payload = {
             "keyword": keyword.strip(),
-            "n_new": int(n_new),
+            "n_new_videos": int(n_new),
+            "max_candidates": 50,
             "mode": "audio_first",
             "longform": {
                 "chunk_seconds": int(chunk_seconds),
