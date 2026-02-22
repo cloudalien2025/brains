@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import logging
 import shutil
 import subprocess
 import tempfile
@@ -31,6 +32,10 @@ class TranscriptRequest(BaseModel):
 
 
 app = FastAPI(title="Brains Worker")
+logger = logging.getLogger(__name__)
+
+
+HTTPStatusValue = int | str
 
 
 def _read_expected_api_key() -> str:
@@ -164,10 +169,10 @@ def _full_text(segments: list[dict[str, Any]]) -> str:
     return " ".join((segment.get("text") or "").strip() for segment in segments).strip()
 
 
-def timedtext_list_tracks(video_id: str, *, proxy: str | None) -> tuple[int | None, list[dict], str | None]:
+def timedtext_list_tracks(video_id: str, *, proxy: str | None) -> tuple[HTTPStatusValue, list[dict], str | None]:
     url = f"https://www.youtube.com/api/timedtext?type=list&v={video_id}"
     proxies = {"http": proxy, "https": proxy} if proxy else None
-    status_code: int | None = None
+    status_code: HTTPStatusValue = "exception"
     for _ in range(3):
         try:
             response = requests.get(url, timeout=15, proxies=proxies)
@@ -191,6 +196,7 @@ def timedtext_list_tracks(video_id: str, *, proxy: str | None) -> tuple[int | No
             tracks = [track for track in tracks if track.get("lang_code")]
             return status_code, tracks, None
         except requests.RequestException:
+            status_code = "exception"
             continue
         except ET.ParseError:
             return status_code, [], "TIMEDTEXT_LIST_PARSE_ERROR"
@@ -211,7 +217,7 @@ def _pick_best_track(tracks: list[dict], preferred_language: str | None) -> dict
     return sorted(tracks, key=sort_key)[0]
 
 
-def timedtext_fetch_track(video_id: str, track: dict, *, proxy: str | None) -> tuple[int | None, str | None, str | None]:
+def timedtext_fetch_track(video_id: str, track: dict, *, proxy: str | None) -> tuple[HTTPStatusValue, str | None, str | None]:
     proxies = {"http": proxy, "https": proxy} if proxy else None
     params = {"v": video_id, "lang": track.get("lang_code") or ""}
     if track.get("kind") == "asr":
@@ -219,7 +225,7 @@ def timedtext_fetch_track(video_id: str, track: dict, *, proxy: str | None) -> t
     if track.get("name"):
         params["name"] = track.get("name")
 
-    status_code: int | None = None
+    status_code: HTTPStatusValue = "exception"
     for fmt in ("srv3", "vtt", None):
         attempt_params = dict(params)
         if fmt:
@@ -237,8 +243,9 @@ def timedtext_fetch_track(video_id: str, track: dict, *, proxy: str | None) -> t
                     continue
                 return status_code, _full_text(segments), None
             except requests.RequestException:
+                status_code = "exception"
                 continue
-    if status_code:
+    if isinstance(status_code, int):
         return status_code, None, f"TIMEDTEXT_FETCH_HTTP_{status_code}"
     return status_code, None, "TIMEDTEXT_FETCH_FAILED"
 
@@ -253,7 +260,7 @@ def _run_ytdlp_download(video_id: str, proxy: str | None, work_dir: str, diagnos
     if not yt_dlp_bin:
         diagnostics["audio_download_status"] = "failed"
         diagnostics["audio_download_elapsed_ms"] = round((time.perf_counter() - start) * 1000, 2)
-        raise _http_error(503, "YTDLP_NOT_AVAILABLE", "yt-dlp is not available", diagnostics)
+        raise _http_error(502, "YTDLP_DOWNLOAD_FAILED", "yt-dlp is not available", diagnostics)
 
     output_template = str(Path(work_dir) / "%(id)s.%(ext)s")
     cmd = [
@@ -277,25 +284,21 @@ def _run_ytdlp_download(video_id: str, proxy: str | None, work_dir: str, diagnos
     diagnostics["audio_download_elapsed_ms"] = round((time.perf_counter() - start) * 1000, 2)
     if completed.returncode != 0:
         diagnostics["audio_download_status"] = "failed"
-        diagnostics["audio_download_error_code"] = "YTDLP_FAILED"
+        diagnostics["audio_download_error_code"] = "YTDLP_DOWNLOAD_FAILED"
         diagnostics["audio_download_stderr_tail"] = _tail(completed.stderr)
-        status_code = 502
-        err_code = "YOUTUBE_ACCESS_BLOCKED"
-        error = "YouTube audio download failed"
-        lowered = (completed.stderr or "").lower()
-        if "429" in lowered:
-            status_code, err_code, error = 503, "YOUTUBE_RATE_LIMITED", "YouTube rate limit or access block"
-        raise _http_error(status_code, err_code, error, diagnostics)
+        logger.error("yt-dlp failed for video_id=%s", video_id)
+        raise _http_error(502, "YTDLP_DOWNLOAD_FAILED", "YouTube audio download failed", diagnostics)
 
     audio_files = [p for p in Path(work_dir).glob("*") if p.is_file() and p.name != "audio.wav"]
     if not audio_files:
         diagnostics["audio_download_status"] = "failed"
-        diagnostics["audio_download_error_code"] = "YTDLP_NO_OUTPUT"
-        raise _http_error(502, "AUDIO_DOWNLOAD_EMPTY", "yt-dlp succeeded but produced no audio file", diagnostics)
+        diagnostics["audio_download_error_code"] = "YTDLP_DOWNLOAD_FAILED"
+        raise _http_error(502, "YTDLP_DOWNLOAD_FAILED", "yt-dlp succeeded but produced no audio file", diagnostics)
 
     audio_path = audio_files[0]
     diagnostics["audio_download_status"] = "success"
     diagnostics["audio_file_bytes"] = audio_path.stat().st_size
+    logger.info("yt-dlp succeeded for video_id=%s bytes=%s", video_id, diagnostics["audio_file_bytes"])
     return audio_path
 
 
@@ -307,7 +310,7 @@ def _transcribe_with_openai(audio_path: Path, diagnostics: dict[str, Any]) -> st
     if not api_key:
         diagnostics["stt_status"] = "failed"
         diagnostics["stt_error_code"] = "OPENAI_KEY_MISSING"
-        raise _http_error(503, "OPENAI_KEY_MISSING", "OpenAI API key missing on worker", diagnostics)
+        raise _http_error(503, "STT_FAILED", "OpenAI API key missing on worker", diagnostics)
 
     start = time.perf_counter()
     with audio_path.open("rb") as audio_handle:
@@ -325,10 +328,7 @@ def _transcribe_with_openai(audio_path: Path, diagnostics: dict[str, Any]) -> st
         diagnostics["stt_http_status"] = response.status_code
         diagnostics["stt_error_code"] = f"OPENAI_{response.status_code}"
         diagnostics["stt_error_tail"] = _tail(response.text)
-        if response.status_code == 429:
-            raise _http_error(503, "OPENAI_429", "OpenAI rate limited", diagnostics)
-        if response.status_code in {400, 401, 403}:
-            raise _http_error(503, f"OPENAI_{response.status_code}", "OpenAI request rejected", diagnostics)
+        logger.error("STT failed for audio_path=%s status=%s", audio_path.name, response.status_code)
         raise _http_error(503, "STT_FAILED", "STT provider failed", diagnostics)
 
     payload = response.json()
@@ -336,8 +336,9 @@ def _transcribe_with_openai(audio_path: Path, diagnostics: dict[str, Any]) -> st
     if not text:
         diagnostics["stt_status"] = "failed"
         diagnostics["stt_error_code"] = "OPENAI_EMPTY_TRANSCRIPT"
-        raise _http_error(503, "STT_EMPTY_TRANSCRIPT", "STT returned empty transcript", diagnostics)
+        raise _http_error(503, "STT_FAILED", "STT returned empty transcript", diagnostics)
     diagnostics["stt_status"] = "success"
+    logger.info("STT succeeded for audio_path=%s", audio_path.name)
     return text
 
 
@@ -378,72 +379,90 @@ def transcript(
 ) -> dict[str, Any]:
     _require_api_key(x_api_key or x_api_key_lower)
 
-    video_id = extract_video_id(payload.source_id, payload.url)
-    if not video_id:
-        raise HTTPException(status_code=400, detail={"error_code": "INVALID_VIDEO_ID", "error": "Unable to determine YouTube video_id from source_id/url"})
-
-    preferred_langs = payload.preferred_langs or ["en", "en-US", "en-GB"]
-    preferred_language = payload.preferred_language or (preferred_langs[0] if preferred_langs else "en")
-
-    proxy_manager = ProxyManager()
-    proxy_url = None
-    if payload.proxy_enabled is None:
-        proxy_url = build_proxy_url(proxy_manager, proxy_session_key=video_id) or build_decodo_proxy_url(payload.proxy_country, payload.proxy_sticky, video_id)
-    elif payload.proxy_enabled:
-        proxy_url = build_decodo_proxy_url(payload.proxy_country, payload.proxy_sticky, video_id) or build_proxy_url(proxy_manager, proxy_session_key=video_id)
-
     diagnostics: dict[str, Any] = {
-        "proxy_enabled": bool(proxy_url),
-        "preferred_language": preferred_language,
+        "proxy_enabled": False,
+        "preferred_language": None,
         "timedtext_tracks_found": 0,
-        "timedtext_list_http_status": None,
-        "timedtext_fetch_http_status": None,
+        "timedtext_list_http_status": "exception",
+        "timedtext_fetch_http_status": 0,
         "timedtext_best_track": None,
         "audio_fallback_enabled": payload.allow_audio_fallback,
         "audio_fallback_attempted": False,
         "audio_download_status": "not_attempted",
-        "audio_file_bytes": None,
-        "audio_download_elapsed_ms": None,
-        "stt_provider": None,
-        "stt_model": None,
+        "audio_file_bytes": 0,
+        "audio_download_elapsed_ms": 0,
+        "stt_provider": "openai",
+        "stt_model": (os.getenv("BRAINS_TRANSCRIBE_MODEL") or "gpt-4o-mini-transcribe").strip(),
         "stt_status": "not_attempted",
-        "stt_elapsed_ms": None,
+        "stt_elapsed_ms": 0,
     }
 
-    list_status, tracks, list_error = timedtext_list_tracks(video_id, proxy=proxy_url)
-    diagnostics["timedtext_list_http_status"] = list_status
-    diagnostics["timedtext_tracks_found"] = len(tracks)
-    if list_error and list_error == "TIMEDTEXT_LIST_FAILED":
-        raise _http_error(502, "TIMEDTEXT_LIST_FAILED", "Failed to list caption tracks", diagnostics)
+    try:
+        video_id = extract_video_id(payload.source_id, payload.url)
+        if not video_id:
+            raise _http_error(400, "INVALID_VIDEO_ID", "Unable to determine YouTube video_id from source_id/url", diagnostics)
 
-    best_track = _pick_best_track(tracks, preferred_language)
-    if best_track:
-        diagnostics["timedtext_best_track"] = {
-            "lang": best_track.get("lang_code"),
-            "kind": best_track.get("kind"),
-        }
-        fetch_status, transcript_text, fetch_error = timedtext_fetch_track(video_id, best_track, proxy=proxy_url)
-        diagnostics["timedtext_fetch_http_status"] = fetch_status
-        if transcript_text:
-            return {
-                "video_id": video_id,
-                "transcript_source": "captions",
-                "transcript_text": transcript_text,
-                "diagnostics": diagnostics,
+        preferred_langs = payload.preferred_langs or ["en", "en-US", "en-GB"]
+        preferred_language = payload.preferred_language or (preferred_langs[0] if preferred_langs else "en")
+
+        proxy_manager = ProxyManager()
+        proxy_url = None
+        if payload.proxy_enabled is None:
+            proxy_url = build_proxy_url(proxy_manager, proxy_session_key=video_id) or build_decodo_proxy_url(payload.proxy_country, payload.proxy_sticky, video_id)
+        elif payload.proxy_enabled:
+            proxy_url = build_decodo_proxy_url(payload.proxy_country, payload.proxy_sticky, video_id) or build_proxy_url(proxy_manager, proxy_session_key=video_id)
+
+        diagnostics["proxy_enabled"] = bool(proxy_url)
+        diagnostics["preferred_language"] = preferred_language
+
+        logger.info("Caption attempt started for video_id=%s fallback_enabled=%s", video_id, payload.allow_audio_fallback)
+
+        list_status, tracks, list_error = timedtext_list_tracks(video_id, proxy=proxy_url)
+        diagnostics["timedtext_list_http_status"] = list_status
+        diagnostics["timedtext_tracks_found"] = len(tracks)
+        if list_error and list_error == "TIMEDTEXT_LIST_FAILED":
+            raise _http_error(502, "TIMEDTEXT_LIST_FAILED", "Failed to list caption tracks", diagnostics)
+
+        best_track = _pick_best_track(tracks, preferred_language)
+        if best_track:
+            diagnostics["timedtext_best_track"] = {
+                "lang": best_track.get("lang_code"),
+                "kind": best_track.get("kind"),
             }
-        if fetch_error and fetch_error.startswith("TIMEDTEXT_FETCH_HTTP_4"):
-            raise _http_error(502, "TIMEDTEXT_FETCH_FAILED", "Failed to fetch captions", diagnostics)
+            fetch_status, transcript_text, fetch_error = timedtext_fetch_track(video_id, best_track, proxy=proxy_url)
+            diagnostics["timedtext_fetch_http_status"] = fetch_status
+            if transcript_text:
+                logger.info("Caption attempt succeeded for video_id=%s", video_id)
+                return {
+                    "video_id": video_id,
+                    "transcript_source": "captions",
+                    "transcript_text": transcript_text,
+                    "diagnostics": diagnostics,
+                }
+            if fetch_error and fetch_error.startswith("TIMEDTEXT_FETCH_HTTP_4"):
+                raise _http_error(502, "TIMEDTEXT_FETCH_FAILED", "Failed to fetch captions", diagnostics)
 
-    if not payload.allow_audio_fallback:
-        raise _http_error(422, "CAPTIONS_UNAVAILABLE_AND_FALLBACK_DISABLED", "No captions available and audio fallback disabled", diagnostics)
+        if not payload.allow_audio_fallback:
+            logger.warning("No caption tracks and fallback disabled for video_id=%s", video_id)
+            raise _http_error(422, "NO_CAPTIONS_FALLBACK_DISABLED", "No captions available and audio fallback disabled", diagnostics)
 
-    diagnostics["audio_fallback_attempted"] = True
-    text = _audio_fallback(video_id, proxy_url, diagnostics, debug_keep_files=payload.debug_keep_files)
-    if not text:
-        raise _http_error(500, "TRANSCRIPT_EMPTY", "Transcript generation returned empty text", diagnostics)
-    return {
-        "video_id": video_id,
-        "transcript_source": "audio",
-        "transcript_text": text,
-        "diagnostics": diagnostics,
-    }
+        diagnostics["audio_fallback_attempted"] = True
+        logger.info("Fallback triggered for video_id=%s", video_id)
+        text = _audio_fallback(video_id, proxy_url, diagnostics, debug_keep_files=payload.debug_keep_files)
+        if not text:
+            logger.error("Transcript missing after fallback for video_id=%s", video_id)
+            raise _http_error(500, "UNEXPECTED_SERVER_ERROR", "Transcript generation returned empty text", diagnostics)
+        logger.info("Final outcome success for video_id=%s source=audio", video_id)
+        return {
+            "video_id": video_id,
+            "transcript_source": "audio",
+            "transcript_text": text,
+            "diagnostics": diagnostics,
+        }
+    except HTTPException:
+        logger.exception("Final outcome error for transcript request")
+        raise
+    except Exception:
+        logger.exception("Final outcome unexpected server error")
+        raise _http_error(500, "UNEXPECTED_SERVER_ERROR", "Unexpected server error", diagnostics)
+
