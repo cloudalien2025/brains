@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import csv
+import http.cookiejar
 import json
 import logging
 import os
@@ -15,11 +17,13 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+import xml.etree.ElementTree as ET
 
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse
 from openai import OpenAI
 from pydantic import BaseModel, Field
+import requests
 
 from apps.brains_worker.discovery import DiscoveryError, DiscoveryOutcome, discover_youtube_videos
 
@@ -37,6 +41,8 @@ MAX_CONCURRENT_SYNTHESIS = int(os.getenv("MAX_CONCURRENT_SYNTHESIS", "1"))
 CHUNK_SECONDS = int(os.getenv("CHUNK_SECONDS", "600"))
 OVERLAP_SECONDS = int(os.getenv("OVERLAP_SECONDS", "15"))
 ARCHIVE_AUDIO = (os.getenv("ARCHIVE_AUDIO", "false").lower() in {"1", "true", "yes", "on"})
+AUDIO_FALLBACK_ENABLED = os.getenv("AUDIO_FALLBACK_ENABLED", "0").lower() in {"1", "true", "yes", "on"}
+COOKIES_PATHS = [Path("/workspace/brains/cookies/youtube_cookies.txt"), Path("/workspace/brains/cookies/youtube_storage_state.json")]
 
 
 
@@ -134,6 +140,7 @@ def write_report(root: Path, run_id: str, run_payload: dict[str, Any]) -> None:
             "extraction": f"extractions/yt_{vid}.v1.json",
             "diagnostics": f"diagnostics/yt_{vid}.json",
         })
+    attempts = load_transcript_attempts(root, run_id)
     report_payload = {
         "run_id": run_id,
         "brain_id": run_payload.get("brain_id"),
@@ -142,9 +149,11 @@ def write_report(root: Path, run_id: str, run_payload: dict[str, Any]) -> None:
         "youtube_api_http_status": (run_payload.get("discovery") or {}).get("youtube_api_http_status"),
         "candidates_found": int(run_payload.get("candidates_found") or 0),
         "ingested_new": len(run_payload.get("ingested_video_ids", [])),
-        "transcripts_succeeded": len(run_payload.get("ingested_video_ids", [])),
-        "transcripts_failed": len(run_payload.get("errors", [])),
+        "transcripts_succeeded": sum(1 for x in attempts if x.get("result") == "success"),
+        "transcripts_failed": sum(1 for x in attempts if x.get("result") == "fail"),
+        "transcript_failure_reasons": summarize_transcript_failures(attempts),
         "brain_pack_id": (run_payload.get("brain_pack") or {}).get("brain_pack_id"),
+        "transcript_attempts_jsonl": str(run_dir(root, run_id) / "transcript_attempts.jsonl"),
         "artifacts": artifacts,
         "brain_root": str(root),
         "updated_at": utc_now(),
@@ -163,6 +172,112 @@ def update_ledger(root: Path, record: dict[str, Any]) -> None:
         ledger["ingested_video_ids"].append(vid)
     ledger["records"].append(record)
     write_json(root / "ledger.json", ledger)
+
+
+def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def load_transcript_attempts(root: Path, run_id: str) -> list[dict[str, Any]]:
+    path = run_dir(root, run_id) / "transcript_attempts.jsonl"
+    if not path.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return rows
+
+
+def summarize_transcript_failures(attempts: list[dict[str, Any]]) -> dict[str, int]:
+    counts = Counter((x.get("error_code") or "unknown") for x in attempts if x.get("result") == "fail")
+    return dict(counts.most_common(10))
+
+
+def sample_failures(attempts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out = []
+    for row in attempts:
+        if row.get("result") != "fail":
+            continue
+        out.append({"video_id": row.get("video_id"), "method": row.get("method"), "http_status": row.get("http_status"), "error_code": row.get("error_code"), "error_message": row.get("error_message")})
+        if len(out) >= 3:
+            break
+    return out
+
+
+def _build_proxy() -> tuple[bool, str | None, dict[str, str] | None]:
+    proxy_url = (os.getenv("DECODO_PROXY_URL") or os.getenv("RESIDENTIAL_PROXY_URL") or os.getenv("HTTPS_PROXY") or "").strip()
+    if not proxy_url:
+        return False, None, None
+    return True, "decodo", {"http": proxy_url, "https": proxy_url}
+
+
+def _cookie_source() -> Path | None:
+    for path in COOKIES_PATHS:
+        if path.exists():
+            return path
+    return None
+
+
+def _build_http_session() -> tuple[requests.Session, dict[str, Any]]:
+    session = requests.Session()
+    proxy_enabled, provider, proxies = _build_proxy()
+    if proxies:
+        session.proxies.update(proxies)
+    source = _cookie_source()
+    cookies_enabled = False
+    if source and source.suffix == ".txt":
+        jar = http.cookiejar.MozillaCookieJar(str(source))
+        try:
+            jar.load(ignore_discard=True, ignore_expires=True)
+            session.cookies.update(jar)
+            cookies_enabled = True
+        except Exception:
+            cookies_enabled = False
+    return session, {
+        "proxy_enabled": proxy_enabled,
+        "proxy_provider": provider,
+        "cookies_enabled": cookies_enabled,
+        "cookies_source": str(source) if source else None,
+    }
+
+
+def _caption_tracks(session: requests.Session, video_id: str) -> tuple[list[dict[str, str]], int | None, str | None]:
+    resp = session.get("https://www.youtube.com/api/timedtext", params={"type": "list", "v": video_id}, timeout=20)
+    if resp.status_code != 200:
+        return [], resp.status_code, f"caption_probe_http_{resp.status_code}"
+    root = ET.fromstring(resp.text or "<transcript_list/>")
+    tracks = []
+    for node in root.findall("track"):
+        tracks.append({
+            "lang_code": node.attrib.get("lang_code", ""),
+            "name": node.attrib.get("name", ""),
+            "kind": node.attrib.get("kind", ""),
+        })
+    return tracks, resp.status_code, None
+
+
+def _fetch_timedtext_transcript(session: requests.Session, video_id: str, track: dict[str, str]) -> tuple[str, int | None]:
+    params = {"v": video_id, "lang": track.get("lang_code") or "en", "fmt": "srv3"}
+    if track.get("kind"):
+        params["kind"] = track["kind"]
+    if track.get("name"):
+        params["name"] = track["name"]
+    resp = session.get("https://www.youtube.com/api/timedtext", params=params, timeout=20)
+    if resp.status_code != 200:
+        raise RuntimeError(f"HTTP {resp.status_code}")
+    root = ET.fromstring(resp.text or "<transcript/>")
+    lines = [html.unescape((n.text or "").strip()) for n in root.findall("text")]
+    transcript = "\n".join(x for x in lines if x)
+    return transcript, resp.status_code
 
 
 class BrainCreateRequest(BaseModel):
@@ -403,7 +518,8 @@ async def process_run(job: dict[str, Any]) -> None:
         return
 
     existing_ids = set(ledger.get("ingested_video_ids", []))
-    selected = [c for c in candidates if c.get("video_id") and c.get("video_id") not in existing_ids][: payload.n_new_videos]
+    selected_pool = [c for c in candidates if c.get("video_id") and c.get("video_id") not in existing_ids]
+    selected: list[dict[str, Any]] = []
     skipped_duplicates = max(0, len(candidates) - len([c for c in candidates if c.get("video_id") not in existing_ids]))
 
     run["discovery"] = {
@@ -414,7 +530,7 @@ async def process_run(job: dict[str, Any]) -> None:
     }
     run["candidates_found"] = len(candidates)
     run["candidates"] = candidates[:50]
-    run["selected_new"] = len(selected)
+    run["selected_new"] = 0
     run["skipped_duplicates"] = skipped_duplicates
     run["progress"] = {"total": len(selected), "done": 0, "failed": 0, "stage": "ingesting"}
 
@@ -429,7 +545,7 @@ async def process_run(job: dict[str, Any]) -> None:
         write_report(root, run_id, run)
         return
 
-    if len(selected) == 0:
+    if len(selected_pool) == 0:
         run["status"] = "completed"
         run["message"] = "No new videos; all candidates already ingested"
         run["stage"] = "completed"
@@ -439,6 +555,58 @@ async def process_run(job: dict[str, Any]) -> None:
         write_report(root, run_id, run)
         return
 
+    transcript_attempts_path = run_dir(root, run_id) / "transcript_attempts.jsonl"
+    if transcript_attempts_path.exists():
+        transcript_attempts_path.unlink()
+
+    session, session_diag = _build_http_session()
+    caption_eligible: list[dict[str, Any]] = []
+    for src in selected_pool:
+        if len(caption_eligible) >= payload.n_new_videos:
+            break
+        vid = src.get("video_id", "")
+        started = time.perf_counter()
+        attempt = {
+            "run_id": run_id,
+            "video_id": vid,
+            "video_url": src.get("url"),
+            "method": "timedtext_probe",
+            **session_diag,
+            "http_status": None,
+            "error_code": None,
+            "error_message": None,
+            "caption_tracks_found": 0,
+            "selected_track": None,
+            "elapsed_ms": 0,
+            "result": "fail",
+            "chars": 0,
+        }
+        try:
+            tracks, status, probe_err = _caption_tracks(session, vid)
+            attempt["http_status"] = status
+            attempt["caption_tracks_found"] = len(tracks)
+            if probe_err:
+                attempt["error_code"] = probe_err
+                attempt["error_message"] = probe_err
+            elif tracks:
+                track = next((t for t in tracks if (t.get("lang_code") or "").startswith("en")), tracks[0])
+                attempt["selected_track"] = track
+                attempt["result"] = "success"
+                src["selected_track"] = track
+                caption_eligible.append(src)
+            else:
+                attempt["error_code"] = "no_captions"
+                attempt["error_message"] = "No caption tracks returned"
+        except Exception as exc:
+            attempt["error_code"] = "caption_probe_error"
+            attempt["error_message"] = str(exc)
+        attempt["elapsed_ms"] = round((time.perf_counter() - started) * 1000, 2)
+        append_jsonl(transcript_attempts_path, attempt)
+
+    selected = caption_eligible
+    if not selected and AUDIO_FALLBACK_ENABLED:
+        selected = selected_pool[: payload.n_new_videos]
+    run["selected_new"] = len(selected)
     write_run(root, run_id, run)
     write_status(root, run_id, run)
 
@@ -463,26 +631,76 @@ async def process_run(job: dict[str, Any]) -> None:
                 transcript_path.write_text(transcript, encoding="utf-8")
                 diag["stages"].append("global_cache_hit")
             else:
-                async with DOWNLOAD_SEM:
-                    audio_path = tmp_dir / f"yt_{vid}.audio.m4a"
-                    subprocess.run(["yt-dlp", "-f", "bestaudio/best", "-o", str(audio_path), src.get("url")], check=True, capture_output=True)
-                async with STT_SEM:
-                    run["stage"] = "extracting"
-                    run["current"] = {"video_id": vid, "stage": "extracting", "detail": "Transcribing audio"}
-                    write_run(root, run_id, run)
-                    write_status(root, run_id, run)
-                    transcript, stt_diag = transcribe_audio_chunks(
-                        video_id=vid,
-                        audio_path=audio_path,
-                        chunk_seconds=payload.longform.get("chunk_seconds", CHUNK_SECONDS),
-                        overlap_seconds=payload.longform.get("overlap_seconds", OVERLAP_SECONDS),
-                        preferred_language=payload.preferred_language,
-                        tmp_dir=tmp_dir,
-                    )
-                    diag["stt"] = stt_diag
+                track = src.get("selected_track") or {"lang_code": payload.preferred_language}
+                transcript_ok = False
+                for retry in range(4):
+                    started = time.perf_counter()
+                    attempt = {
+                        "run_id": run_id,
+                        "video_id": vid,
+                        "video_url": src.get("url"),
+                        "method": "timedtext",
+                        **session_diag,
+                        "http_status": None,
+                        "error_code": None,
+                        "error_message": None,
+                        "caption_tracks_found": 1,
+                        "selected_track": track,
+                        "elapsed_ms": 0,
+                        "result": "fail",
+                        "chars": 0,
+                    }
+                    try:
+                        transcript, status = _fetch_timedtext_transcript(session, vid, track)
+                        attempt["http_status"] = status
+                        if transcript.strip():
+                            attempt["result"] = "success"
+                            attempt["chars"] = len(transcript)
+                            transcript_ok = True
+                            append_jsonl(transcript_attempts_path, attempt)
+                            break
+                        attempt["error_code"] = "empty_transcript"
+                        attempt["error_message"] = "timedtext returned empty transcript"
+                    except Exception as exc:
+                        msg = str(exc)
+                        attempt["error_message"] = msg
+                        if "429" in msg:
+                            attempt["error_code"] = "blocked_429"
+                        elif "403" in msg:
+                            attempt["error_code"] = "blocked_403"
+                        else:
+                            attempt["error_code"] = "timedtext_error"
+                    attempt["elapsed_ms"] = round((time.perf_counter() - started) * 1000, 2)
+                    append_jsonl(transcript_attempts_path, attempt)
+                    if attempt["error_code"] in {"blocked_429", "blocked_403"} and retry < 3:
+                        time.sleep(2**retry)
+                        session, session_diag = _build_http_session()
+                        continue
+                    break
+
+                if not transcript_ok and AUDIO_FALLBACK_ENABLED:
+                    async with DOWNLOAD_SEM:
+                        audio_path = tmp_dir / f"yt_{vid}.audio.m4a"
+                        subprocess.run(["yt-dlp", "-f", "bestaudio/best", "-o", str(audio_path), src.get("url")], check=True, capture_output=True)
+                    async with STT_SEM:
+                        run["stage"] = "extracting"
+                        run["current"] = {"video_id": vid, "stage": "extracting", "detail": "Transcribing audio"}
+                        write_run(root, run_id, run)
+                        write_status(root, run_id, run)
+                        transcript, stt_diag = transcribe_audio_chunks(
+                            video_id=vid,
+                            audio_path=audio_path,
+                            chunk_seconds=payload.longform.get("chunk_seconds", CHUNK_SECONDS),
+                            overlap_seconds=payload.longform.get("overlap_seconds", OVERLAP_SECONDS),
+                            preferred_language=payload.preferred_language,
+                            tmp_dir=tmp_dir,
+                        )
+                        diag["stt"] = stt_diag
+                elif not transcript_ok:
+                    raise RuntimeError("No transcript available and audio fallback disabled")
                 transcript_path.write_text(transcript, encoding="utf-8")
                 global_cache.write_text(transcript, encoding="utf-8")
-                diag["stages"].append("audio_stt")
+                diag["stages"].append("timedtext_or_fallback")
 
             source_meta = {
                 "video_id": vid,
@@ -531,7 +749,7 @@ async def process_run(job: dict[str, Any]) -> None:
     run["errors"] = errors
     run["ingested_video_ids"] = ingested_ids
     run["brain_pack"] = pack_info
-    run["status"] = "completed" if not errors else ("completed_with_errors" if ingested_ids else "failed")
+    run["status"] = "completed" if not errors else ("partial_success" if ingested_ids else "failed")
     run["progress"]["stage"] = "completed"
     run["stage"] = "completed"
     run["current"] = None
@@ -640,6 +858,16 @@ def get_run(run_id: str, x_api_key: str | None = Header(default=None, alias="X-A
         if not legacy_matches:
             raise HTTPException(status_code=404, detail="Run not found")
         payload = status_from_run(load_json(legacy_matches[0], {}))
+    run_matches = list(BRAINS_ROOT.glob(f"*/runs/{run_id}/run.json"))
+    if run_matches:
+        run_payload = load_json(run_matches[0], {})
+        root = run_matches[0].parents[2]
+        attempts = load_transcript_attempts(root, run_id)
+        payload["transcript_failure_reasons"] = summarize_transcript_failures(attempts)
+        payload["sample_failures"] = sample_failures(attempts)
+        payload["transcript_attempts_jsonl"] = str(run_dir(root, run_id) / "transcript_attempts.jsonl")
+        payload["transcripts_succeeded"] = sum(1 for x in attempts if x.get("result") == "success")
+        payload["transcripts_failed"] = sum(1 for x in attempts if x.get("result") == "fail")
     elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
     logger.info("get_run_status end run_id=%s elapsed_ms=%s", run_id, elapsed_ms)
     return payload
@@ -668,7 +896,34 @@ def build_run_pack(run_id: str, x_api_key: str | None = Header(default=None, ali
     write_run(root, run_id, run)
     write_status(root, run_id, run)
     write_report(root, run_id, run)
+    attempts = load_transcript_attempts(root, run_id)
+    info["diagnostics_summary"] = {
+        "transcript_failure_reasons": summarize_transcript_failures(attempts),
+        "sample_failures": sample_failures(attempts),
+        "transcript_attempts_jsonl": str(run_dir(root, run_id) / "transcript_attempts.jsonl"),
+    }
     return info
+
+
+@app.get("/v1/runs/{run_id}/brain-pack")
+def get_or_build_run_pack(run_id: str, x_api_key: str | None = Header(default=None, alias="X-Api-Key")) -> dict[str, Any]:
+    require_api_key(x_api_key)
+    run_matches = list(BRAINS_ROOT.glob(f"*/runs/{run_id}/run.json"))
+    if not run_matches:
+        raise HTTPException(status_code=404, detail="Run not found")
+    run = load_json(run_matches[0], {})
+    if run.get("brain_pack"):
+        root = BRAINS_ROOT / run.get("brain_id")
+        attempts = load_transcript_attempts(root, run_id)
+        return {
+            **run["brain_pack"],
+            "diagnostics_summary": {
+                "transcript_failure_reasons": summarize_transcript_failures(attempts),
+                "sample_failures": sample_failures(attempts),
+                "transcript_attempts_jsonl": str(run_dir(root, run_id) / "transcript_attempts.jsonl"),
+            },
+        }
+    return build_run_pack(run_id, x_api_key)
 
 
 @app.get("/v1/brain-packs/{brain_pack_id}")

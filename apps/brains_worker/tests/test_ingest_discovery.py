@@ -105,3 +105,33 @@ def test_ingest_all_duplicates_completes_cleanly(monkeypatch, tmp_path):
 
     run_json = module.load_json(module.BRAINS_ROOT / brain_id / "runs" / start.json()["run_id"] / "run.json", {})
     assert run_json["message"] == "No new videos; all candidates already ingested"
+
+
+def test_run_status_exposes_transcript_diagnostics(monkeypatch, tmp_path):
+    module = _load_module(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        module,
+        "discover_youtube_videos",
+        lambda **kwargs: module.DiscoveryOutcome(candidates=[], method="youtube_api", youtube_api_http_status=200),
+    )
+
+    with TestClient(module.app) as client:
+        create = client.post(
+            "/v1/brains",
+            headers={"X-Api-Key": "test-worker-key"},
+            json={"name": "Diag Brain", "brain_type": "BD"},
+        )
+        brain_id = create.json()["brain_id"]
+
+        start = client.post(
+            f"/v1/brains/{brain_id}/ingest",
+            headers={"X-Api-Key": "test-worker-key"},
+            json={"keyword": "Brilliant Directories", "n_new_videos": 1},
+        )
+        run_id = start.json()["run_id"]
+        _wait_for_terminal_run(client, run_id)
+        status = client.get(f"/v1/runs/{run_id}", headers={"X-Api-Key": "test-worker-key"})
+
+    payload = status.json()
+    assert "transcript_failure_reasons" in payload
+    assert "sample_failures" in payload

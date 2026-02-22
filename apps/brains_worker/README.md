@@ -5,9 +5,9 @@ FastAPI worker that handles heavy ingestion for Brains with API-key auth (`X-Api
 ## Features
 
 - Multi-brain registry with persistent storage on droplet.
-- Incremental ingest queue (`queued -> processing -> completed/completed_with_errors/failed`).
+- Incremental ingest queue (`queued -> processing -> completed/partial_success/failed`).
 - YouTube discovery + dedupe against per-brain ledger.
-- Audio-first transcript acquisition (`yt-dlp` + `ffmpeg` chunking + OpenAI STT).
+- Caption-first transcript acquisition (timedtext with explicit proxy+cookies) with optional audio fallback (`AUDIO_FALLBACK_ENABLED=1`).
 - Profile extraction/synthesis for `BD` and `UAP` brain types.
 - Brain Pack zip builder + metadata/download endpoints.
 
@@ -50,6 +50,7 @@ X-Api-Key: <WORKER_API_KEY>
 - `GET /v1/runs/{run_id}`
 - `GET /v1/runs/{run_id}/report`
 - `POST /v1/runs/{run_id}/brain-pack`
+- `GET /v1/runs/{run_id}/brain-pack`
 - `GET /v1/brain-packs/{brain_pack_id}`
 - `GET /v1/brain-packs/{brain_pack_id}/download`
 
@@ -65,3 +66,12 @@ curl -i -H "X-Api-Key: <KEY>" -H "Content-Type: application/json" \
   -X POST https://worker.aiohut.com/v1/brains/<brain_id>/ingest \
   -d '{"keyword":"Brilliant Directories","n_new_videos":20,"max_candidates":50,"preferred_language":"en"}'
 ```
+
+
+## Smoke test
+
+```bash
+python tools/transcript_smoke_test.py
+```
+
+Outputs deterministic PASS/FAIL for a known-caption video using YouTube timedtext.
