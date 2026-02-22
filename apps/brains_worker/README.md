@@ -1,30 +1,55 @@
-# Brains Worker
+# Brains Worker v1
 
-## Deploy on droplet
+FastAPI worker that handles heavy ingestion for Brains with API-key auth (`X-Api-Key`).
 
-1. SSH to droplet and pull the latest commit in `/opt/brains-worker`.
-2. Install/update deps in venv:
-   - `/opt/brains-worker/.venv/bin/pip install -r apps/brains_worker/requirements.txt`
-3. One-time Playwright browser install (required for cookie bootstrap):
-   - `/opt/brains-worker/.venv/bin/python -m playwright install chromium`
-4. Ensure worker env has:
-   - `BRAINS_API_KEY`
-   - `OPENAI_API_KEY` (required for audio fallback)
-   - `BRAINS_GIT_COMMIT` and `BRAINS_BUILD_TIME_UTC` (optional but recommended for `/transcript/version`)
-5. Ensure cookie directory exists:
-   - `mkdir -p /opt/brains-worker/cookies`
-6. Optional prewarm cookie jar manually:
-   - `/opt/brains-worker/.venv/bin/python tools/bootstrap_youtube_cookies.py --output /opt/brains-worker/cookies/youtube_cookies.txt`
-7. Reload and restart systemd:
-   - `sudo systemctl daemon-reload`
-   - `sudo systemctl restart brains-worker`
-8. Verify service:
-   - `curl -s https://worker.aiohut.com/transcript/version | jq`
-   - `sudo systemctl status brains-worker --no-pager`
+## Features
 
-## Runtime notes
+- Multi-brain registry with persistent storage on droplet.
+- Incremental ingest queue (`queued -> processing -> completed/completed_with_errors/failed`).
+- YouTube discovery + dedupe against per-brain ledger.
+- Audio-first transcript acquisition (`yt-dlp` + `ffmpeg` chunking + OpenAI STT).
+- Profile extraction/synthesis for `BD` and `UAP` brain types.
+- Brain Pack zip builder + metadata/download endpoints.
 
-- Endpoint `GET /transcript/version` reports commit/build and feature availability.
-- Endpoint `POST /transcript` is yt-dlp-subtitles first, then player JSON captions fallback, then OpenAI STT fallback when enabled.
-- Worker attempts to refresh `/opt/brains-worker/cookies/youtube_cookies.txt` when missing/stale before yt-dlp subtitle calls.
-- Failures return non-200 with `error_code`, `error`, and `diagnostics`.
+## Local run
+
+```bash
+pip install -r apps/brains_worker/requirements.txt
+uvicorn apps.brains_worker.main:app --reload --port 8081
+```
+
+Required env vars:
+
+- `WORKER_API_KEY`
+- `OPENAI_API_KEY`
+
+Optional env vars:
+
+- `BRAINS_DATA_DIR` (default `/opt/brains-data`)
+- `MAX_CONCURRENT_DOWNLOADS` (default `3`)
+- `MAX_CONCURRENT_STT` (default `1`)
+- `MAX_CONCURRENT_SYNTHESIS` (default `1`)
+- `CHUNK_SECONDS` (default `600`)
+- `OVERLAP_SECONDS` (default `15`)
+- `ARCHIVE_AUDIO` (default `false`)
+
+## API
+
+All `/v1/*` endpoints require header:
+
+```http
+X-Api-Key: <WORKER_API_KEY>
+```
+
+- `GET /v1/health`
+- `GET /v1/brains`
+- `POST /v1/brains`
+- `GET /v1/brains/{brain_id}`
+- `POST /v1/brains/{brain_id}/ingest`
+- `GET /v1/runs/{run_id}`
+- `GET /v1/runs/{run_id}/report`
+- `POST /v1/runs/{run_id}/brain-pack`
+- `GET /v1/brain-packs/{brain_pack_id}`
+- `GET /v1/brain-packs/{brain_pack_id}/download`
+
+See `apps/brains_worker/DEPLOYMENT.md` for systemd/nginx notes.
