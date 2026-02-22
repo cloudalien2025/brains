@@ -63,6 +63,36 @@ def worker_request(method: str, path: str, json: dict[str, Any] | None = None, p
     return requests.request(method, url, headers=headers, json=json, params=params, timeout=30)
 
 
+def normalize_brain(obj: dict[str, Any]) -> dict[str, Any]:
+    """Normalize worker brain objects to a consistent shape for the UI."""
+    brain_id = obj.get("brain_id") or obj.get("id") or obj.get("uuid")
+    brain_name = obj.get("brain_name") or obj.get("name") or obj.get("title")
+    brain_type = obj.get("brain_type") or obj.get("type") or obj.get("kind")
+    default_keyword = obj.get("default_keyword") or obj.get("keyword") or obj.get("defaultKey")
+    return {
+        "brain_id": brain_id,
+        "brain_name": brain_name,
+        "brain_type": brain_type,
+        "default_keyword": default_keyword,
+        "_raw": obj,
+    }
+
+
+def build_create_brain_payload(brain_name: str, brain_type: str, default_keyword: str | None) -> dict[str, Any]:
+    """Build a payload compatible with worker schema variations."""
+    kw = (default_keyword or "").strip() or None
+    name = brain_name.strip()
+
+    payload = {
+        "name": name,
+        "brain_type": brain_type,
+        "default_keyword": kw,
+        "brain_name": name,
+        "type": brain_type,
+    }
+    return payload
+
+
 def fetch_brains() -> None:
     if not worker_url or not worker_api_key:
         return
@@ -70,7 +100,8 @@ def fetch_brains() -> None:
         response = worker_request("GET", "/v1/brains")
         if response.ok:
             payload = response.json()
-            st.session_state["brains"] = payload if isinstance(payload, list) else payload.get("items", [])
+            raw_brains = payload if isinstance(payload, list) else payload.get("items", [])
+            st.session_state["brains"] = [normalize_brain(b) for b in raw_brains if isinstance(b, dict)]
         else:
             st.session_state["last_error"] = f"HTTP {response.status_code}: {_snippet(response.text)}"
     except requests.RequestException as exc:
@@ -107,7 +138,10 @@ st.subheader("Brain")
 brains = st.session_state.get("brains", [])
 
 if brains:
-    options = {f"{b.get('brain_name', 'Unnamed')} ({b.get('brain_type', 'Unknown')})": b.get("brain_id") for b in brains}
+    options = {
+        f"{b.get('brain_name', 'Unnamed')} ({b.get('brain_type', 'Unknown')})": b.get("brain_id")
+        for b in brains
+    }
     labels = list(options.keys())
 
     selected_id = st.session_state.get("selected_brain_id")
@@ -134,25 +168,27 @@ with st.expander("Create Brain", expanded=not bool(brains)):
         elif not new_name.strip():
             st.error("brain_name is required.")
         else:
-            payload = {
-                "name": new_name.strip(),
-                "type": new_type,
-                "default_keyword": new_default_keyword.strip() or None,
-            }
+            payload = build_create_brain_payload(new_name, new_type, new_default_keyword)
+            st.session_state["last_create_brain_payload"] = payload
             try:
                 response = worker_request("POST", "/v1/brains", json=payload)
                 if response.ok:
-                    created = response.json()
-                    created_id = created.get("brain_id")
+                    created_norm = normalize_brain(response.json())
+                    created_id = created_norm.get("brain_id")
                     st.success("Brain created.")
                     fetch_brains()
                     if created_id:
                         st.session_state["selected_brain_id"] = created_id
+                    else:
+                        st.error(f"Brain created but brain_id missing in response: {_snippet(response.text)}")
                     st.rerun()
                 else:
                     _render_worker_http_error(response)
             except requests.RequestException as exc:
                 st.error(f"Failed to create brain: {exc}")
+
+with st.expander("Create Brain debug", expanded=False):
+    st.write({"last_create_brain_payload": st.session_state.get("last_create_brain_payload")})
 
 selected_brain = next((b for b in brains if b.get("brain_id") == st.session_state.get("selected_brain_id")), None)
 default_keyword = (selected_brain or {}).get("default_keyword") or ""
