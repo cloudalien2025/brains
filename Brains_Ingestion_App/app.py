@@ -3,8 +3,13 @@ from __future__ import annotations
 import json
 import os
 import platform
+import sys
 from pathlib import Path
 from uuid import uuid4
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 import requests
 import streamlit as st
@@ -136,6 +141,23 @@ with st.expander("Worker diagnostics", expanded=False):
     st.write(f"worker_api_key length: {len(worker_api_key or '')}")
     st.write(f"worker_api_key stripped length: {len(safe_key)}")
     st.write(f"worker_api_key last4: {safe_key[-4:] if len(safe_key) >= 4 else ''}")
+
+    transcription_imported = False
+    transcription_module_file = None
+    transcription_import_error = None
+    try:
+        import adapters.transcription as transcription_module
+
+        transcription_imported = True
+        transcription_module_file = getattr(transcription_module, "__file__", None)
+    except Exception as exc:
+        transcription_import_error = repr(exc)
+
+    st.markdown("**Module import diagnostics**")
+    st.write(f"adapters.transcription imported: {transcription_imported}")
+    st.write(f"adapters.transcription.__file__: {transcription_module_file}")
+    if transcription_import_error:
+        st.write(f"adapters.transcription import error: {transcription_import_error}")
 
 with st.expander("Proxy diagnostics", expanded=False):
     st.json(proxy_manager.safe_diagnostics())
