@@ -135,8 +135,8 @@ with st.expander("Create Brain", expanded=not bool(brains)):
             st.error("brain_name is required.")
         else:
             payload = {
-                "brain_name": new_name.strip(),
-                "brain_type": new_type,
+                "name": new_name.strip(),
+                "type": new_type,
                 "default_keyword": new_default_keyword.strip() or None,
             }
             try:
