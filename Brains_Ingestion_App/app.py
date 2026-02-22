@@ -62,12 +62,12 @@ def fetch_transcript_via_worker(
     proxy_enabled: bool = False,
     proxy_country: str | None = None,
     proxy_sticky: bool = False,
-    timeout: int = 300,
+    timeout: int = 30,
 ) -> dict:
     payload = {
-        "source_id": source_id,
+        "video_id": source_id,
         "preferred_language": preferred_language,
-        "allow_audio_fallback": bool(allow_audio_fallback),
+        "audio_fallback_enabled": bool(allow_audio_fallback),
         "proxy_enabled": bool(proxy_enabled),
         "proxy_country": proxy_country,
         "proxy_sticky": bool(proxy_sticky),
@@ -75,15 +75,32 @@ def fetch_transcript_via_worker(
     payload = {k: v for k, v in payload.items() if v is not None}
 
     headers = _worker_headers(worker_api_key)
-    response = requests.post(
-        f"{worker_url.rstrip('/')}/transcript",
-        headers=headers,
-        json=payload,
-        timeout=timeout,
-    )
+    try:
+        response = requests.post(
+            f"{worker_url.rstrip('/')}/transcript",
+            headers=headers,
+            json=payload,
+            timeout=(5, timeout),
+        )
+        status_code = response.status_code
+        payload_json = _safe_json(response)
+    except requests.exceptions.Timeout:
+        status_code = 0
+        payload_json = {
+            "error": "Worker request timed out",
+            "error_code": "WORKER_TIMEOUT",
+            "diagnostics": {"timeout_seconds": timeout},
+        }
+    except requests.exceptions.RequestException as exc:
+        status_code = 0
+        payload_json = {
+            "error": f"Worker request failed: {exc}",
+            "error_code": "WORKER_REQUEST_FAILED",
+        }
     return {
-        "status_code": response.status_code,
-        "json": _safe_json(response),
+
+        "status_code": status_code,
+        "json": payload_json,
         "header_included": bool((headers.get("x-api-key") or "").strip()),
     }
 
@@ -98,7 +115,7 @@ use_openai_extraction = st.toggle(
     "Use OpenAI for extraction (recommended)",
     value=bool(os.getenv("OPENAI_API_KEY")),
 )
-allow_audio_fallback = st.toggle("Allow audio transcription fallback", value=False)
+allow_audio_fallback = st.toggle("Allow audio transcription fallback (slow)", value=False)
 
 proxy_enabled = st.checkbox("Use Decodo proxy", value=_bool_env("DECODO_ENABLED", False))
 proxy_sticky = st.checkbox(
@@ -258,11 +275,12 @@ if st.button("Generate Brain Pack", type="primary"):
                 proxy_enabled=proxy_enabled,
                 proxy_country=proxy_country.strip() or None,
                 proxy_sticky=proxy_sticky,
+                timeout=30,
             )
             request_preview = {
                 "source_id": video_key,
                 "preferred_language": "en",
-                "allow_audio_fallback": bool(allow_audio_fallback),
+                "audio_fallback_enabled": bool(allow_audio_fallback),
                 "proxy_enabled": bool(proxy_enabled),
                 "proxy_country": proxy_country.strip() or None,
                 "proxy_sticky": bool(proxy_sticky),
