@@ -1,501 +1,309 @@
 from __future__ import annotations
 
-import json
-import os
-import platform
-import sys
-from pathlib import Path
-from uuid import uuid4
-
-APP_DIR = Path(__file__).resolve().parent
-if str(APP_DIR) not in sys.path:
-    sys.path.insert(0, str(APP_DIR))
+import time
+from typing import Any
 
 import requests
 import streamlit as st
 from streamlit.errors import StreamlitSecretNotFoundError
 
-from adapters.extraction import extract_brain_records
-from adapters.youtube_discovery import discover_youtube_videos
-from brainpack.exporters import build_pack_zip, write_json, write_jsonl, write_sources_csv
-from brainpack.utils import now_iso, slugify
-from brainpack.validators import validate_pack_manifest, validate_record, validate_run_metadata, validate_source
-from brains.net.proxy_manager import ProxyConfig, ProxyManager
+
+TERMINAL_RUN_STATES = {"completed", "completed_with_errors", "failed"}
 
 
-
-
-def _bool_env(name: str, default: bool = False) -> bool:
-    return os.getenv(name, str(default)).lower() == "true"
-
-
-def _secret_or_env(name: str) -> str:
+def _secret(name: str) -> str:
     try:
-        secret_value = st.secrets.get(name)
+        value = st.secrets.get(name)
     except StreamlitSecretNotFoundError:
-        secret_value = None
-    if secret_value is not None:
-        return str(secret_value).strip()
-    return (os.getenv(name) or "").strip()
+        value = None
+    return str(value or "").strip()
 
 
-def _worker_headers(worker_api_key: str | None) -> dict:
-    key = (worker_api_key or "").strip()
-    return {"x-api-key": key, "Content-Type": "application/json"}
+def _snippet(text: str, limit: int = 500) -> str:
+    return (text or "")[:limit]
 
 
-def _safe_json(response: requests.Response) -> dict:
-    try:
-        payload = response.json()
-        return payload if isinstance(payload, dict) else {"payload": payload}
-    except Exception:
-        return {"raw": response.text[:2000]}
+def _render_worker_http_error(response: requests.Response) -> None:
+    status = response.status_code
+    body_snippet = _snippet(response.text)
 
-
-def fetch_transcript_via_worker(
-    worker_url: str,
-    worker_api_key: str,
-    source_id: str,
-    *,
-    preferred_language: str | None = None,
-    allow_audio_fallback: bool = False,
-    proxy_enabled: bool = False,
-    proxy_country: str | None = None,
-    proxy_sticky: bool = False,
-    timeout: int = 30,
-) -> dict:
-    payload = {
-        "video_id": source_id,
-        "preferred_language": preferred_language,
-        "audio_fallback_enabled": bool(allow_audio_fallback),
-        "proxy_enabled": bool(proxy_enabled),
-        "proxy_country": proxy_country,
-        "proxy_sticky": bool(proxy_sticky),
-    }
-    payload = {k: v for k, v in payload.items() if v is not None}
-
-    headers = _worker_headers(worker_api_key)
-    try:
-        response = requests.post(
-            f"{worker_url.rstrip('/')}/transcript",
-            headers=headers,
-            json=payload,
-            timeout=(5, timeout),
+    if status == 404:
+        st.error(
+            "Worker is reachable but /v1/health not found. This usually means the droplet is still "
+            "running the old worker. Deploy/restart the new Brains Worker v1 service and confirm "
+            "https://worker.aiohut.com/v1/health returns 200."
         )
-        status_code = response.status_code
-        payload_json = _safe_json(response)
-    except requests.exceptions.Timeout:
-        status_code = 0
-        payload_json = {
-            "error": "Worker request timed out",
-            "error_code": "WORKER_TIMEOUT",
-            "diagnostics": {"timeout_seconds": timeout},
-        }
-    except requests.exceptions.RequestException as exc:
-        status_code = 0
-        payload_json = {
-            "error": f"Worker request failed: {exc}",
-            "error_code": "WORKER_REQUEST_FAILED",
-        }
-    return {
-
-        "status_code": status_code,
-        "json": payload_json,
-        "header_included": bool((headers.get("x-api-key") or "").strip()),
-    }
+    elif status == 401:
+        st.error("Invalid worker API key. Check Streamlit secrets worker_api_key.")
+    else:
+        st.error(f"Worker request failed with HTTP {status}. Response: {body_snippet}")
 
 
-st.set_page_config(page_title="Brains Ingestion", layout="wide")
-st.title("Brains Ingestion")
+st.set_page_config(page_title="Brains ingestion", layout="wide")
+st.title("Brains ingestion")
+st.caption("Select a Brain, ingest new videos by keyword, generate a Brain Pack.")
 
-keyword = st.text_input("Keyword", value="Brilliant Directories")
-max_videos = st.number_input("Max videos", min_value=1, max_value=50, value=5, step=1)
-discovery_only = st.toggle("Discovery only", value=False)
-use_openai_extraction = st.toggle(
-    "Use OpenAI for extraction (recommended)",
-    value=bool(os.getenv("OPENAI_API_KEY")),
-)
-allow_audio_fallback = st.toggle("Allow audio transcription fallback (slow)", value=False)
+for key, default in {
+    "brains": [],
+    "selected_brain_id": None,
+    "run_id": None,
+    "last_report": None,
+    "last_error": None,
+    "brain_pack_id": None,
+}.items():
+    st.session_state.setdefault(key, default)
 
-proxy_enabled = st.checkbox("Use Decodo proxy", value=_bool_env("DECODO_ENABLED", False))
-proxy_sticky = st.checkbox(
-    "Sticky per video",
-    value=os.getenv("DECODO_STICKY_MODE", "per_video") == "per_video",
-    disabled=not proxy_enabled,
-)
-proxy_country = st.text_input("Country (optional)", value=os.getenv("DECODO_COUNTRY", ""), disabled=not proxy_enabled)
+worker_url = _secret("worker_url")
+worker_api_key = _secret("worker_api_key")
 
-worker_url = _secret_or_env("BRAINS_WORKER_URL")
-worker_api_key = _secret_or_env("BRAINS_WORKER_API_KEY")
+
+def worker_request(method: str, path: str, json: dict[str, Any] | None = None, params: dict[str, Any] | None = None) -> requests.Response:
+    url = worker_url.rstrip("/") + path
+    headers = {"X-Api-Key": worker_api_key}
+    return requests.request(method, url, headers=headers, json=json, params=params, timeout=30)
+
+
+def fetch_brains() -> None:
+    if not worker_url or not worker_api_key:
+        return
+    try:
+        response = worker_request("GET", "/v1/brains")
+        if response.ok:
+            payload = response.json()
+            st.session_state["brains"] = payload if isinstance(payload, list) else payload.get("items", [])
+        else:
+            st.session_state["last_error"] = f"HTTP {response.status_code}: {_snippet(response.text)}"
+    except requests.RequestException as exc:
+        st.session_state["last_error"] = str(exc)
+
 
 st.subheader("Worker Status")
-if worker_url and worker_api_key:
-    st.success("Worker ACTIVE (URL + API key present)")
-elif worker_url and not worker_api_key:
-    st.error("Worker URL set but API key missing")
+worker_healthy = False
+
+if not worker_url:
+    st.error("Missing Streamlit secret: worker_url")
+elif not worker_api_key:
+    st.error("Missing Streamlit secret: worker_api_key")
 else:
-    st.warning("Worker disabled")
-
-proxy_manager = ProxyManager(
-    ProxyConfig(
-        enabled=proxy_enabled,
-        gateway_host=os.getenv("DECODO_GATEWAY_HOST", "gate.decodo.com"),
-        gateway_port=int(os.getenv("DECODO_GATEWAY_PORT", "7000")),
-        user=os.getenv("DECODO_USER"),
-        password=os.getenv("DECODO_PASS"),
-        country=proxy_country.strip() or None,
-        sticky_mode="per_video" if proxy_sticky else "off",
-        timeout_seconds=int(os.getenv("DECODO_TIMEOUT_SECONDS", "30")),
-        max_retries=int(os.getenv("DECODO_MAX_RETRIES", "3")),
-    )
-)
-
-st.caption("Default ingestion is transcript-first and does not download video/audio streams.")
-if allow_audio_fallback:
-    st.info("Audio fallback will be requested from the worker if transcript captions are unavailable.")
-if worker_url:
-    st.info(f"Worker routing enabled: {worker_url}")
-
-with st.expander("Worker diagnostics", expanded=False):
-    safe_key = (worker_api_key or "").strip()
-    st.write(f"worker_url present: {bool(worker_url)}")
-    st.write(f"worker_api_key present: {bool(safe_key)}")
-    st.write(f"worker_api_key length: {len(worker_api_key or '')}")
-    st.write(f"worker_api_key stripped length: {len(safe_key)}")
-    st.write(f"worker_api_key last4: {safe_key[-4:] if len(safe_key) >= 4 else ''}")
-
-    transcription_imported = False
-    transcription_module_file = None
-    transcription_import_error = None
     try:
-        import adapters.transcription as transcription_module
-
-        transcription_imported = True
-        transcription_module_file = getattr(transcription_module, "__file__", None)
-    except Exception as exc:
-        transcription_import_error = repr(exc)
-
-    st.markdown("**Module import diagnostics**")
-    st.write(f"adapters.transcription imported: {transcription_imported}")
-    st.write(f"adapters.transcription.__file__: {transcription_module_file}")
-    if transcription_import_error:
-        st.write(f"adapters.transcription import error: {transcription_import_error}")
-
-with st.expander("Proxy diagnostics", expanded=False):
-    st.json(proxy_manager.safe_diagnostics())
-    if st.button("Run proxy IP check"):
-        if worker_url and worker_api_key:
-            try:
-                response = requests.get(
-                    f"{worker_url}/proxy/health",
-                    headers=_worker_headers(worker_api_key),
-                    timeout=15,
-                )
-                st.json(response.json())
-            except Exception as exc:
-                st.error(f"Worker proxy check failed: {exc}")
+        health_response = worker_request("GET", "/v1/health")
+        if health_response.ok:
+            health_json = health_response.json() if health_response.text else {}
+            if isinstance(health_json, dict) and str(health_json.get("status", "")).lower() == "ok":
+                worker_healthy = True
+                st.success("✅ Worker ACTIVE")
+            else:
+                st.error(f"❌ Worker ERROR: unexpected health payload: {_snippet(health_response.text)}")
         else:
-            st.warning("Worker not configured — cannot test proxy.")
+            st.error("❌ Worker ERROR")
+            _render_worker_http_error(health_response)
+    except requests.RequestException as exc:
+        st.error(f"❌ Worker ERROR: {exc}")
 
-if "advanced_logs" not in st.session_state:
-    st.session_state.advanced_logs = []
-if "request_previews" not in st.session_state:
-    st.session_state.request_previews = []
+if worker_healthy:
+    fetch_brains()
 
+st.subheader("Brain")
+brains = st.session_state.get("brains", [])
 
-def _log(video_id: str, message: str) -> None:
-    st.session_state.advanced_logs.append({"video": video_id, "message": message})
+if brains:
+    options = {f"{b.get('brain_name', 'Unnamed')} ({b.get('brain_type', 'Unknown')})": b.get("brain_id") for b in brains}
+    labels = list(options.keys())
 
+    selected_id = st.session_state.get("selected_brain_id")
+    default_index = 0
+    if selected_id:
+        for idx, label in enumerate(labels):
+            if options[label] == selected_id:
+                default_index = idx
+                break
 
-if st.button("Generate Brain Pack", type="primary"):
-    st.session_state.advanced_logs = []
-    st.session_state.request_previews = []
-    os.environ["DECODO_ENABLED"] = "true" if proxy_enabled else "false"
-    os.environ["DECODO_COUNTRY"] = proxy_country.strip()
-    os.environ["DECODO_STICKY_MODE"] = "per_video" if proxy_sticky else "off"
-    runtime_errors: list[str] = []
-    per_video_errors: list[str] = []
-    validation_errors: list[str] = []
-    started_at = now_iso()
-    openai_api_key_present = bool(os.getenv("OPENAI_API_KEY"))
+    selected_label = st.selectbox("Brain", labels, index=default_index)
+    st.session_state["selected_brain_id"] = options[selected_label]
+else:
+    st.info("No brains found yet. Create one below.")
 
-    if not worker_url or not worker_api_key:
-        st.error("Worker not configured. Set BRAINS_WORKER_URL and BRAINS_WORKER_API_KEY in Streamlit Secrets.")
-        st.stop()
+with st.expander("Create Brain", expanded=not bool(brains)):
+    new_name = st.text_input("brain_name", key="new_brain_name")
+    new_type = st.selectbox("brain_type", ["BD", "UAP"], key="new_brain_type")
+    new_default_keyword = st.text_input("default_keyword (optional)", key="new_brain_keyword")
 
-    if not os.getenv("YOUTUBE_API_KEY"):
-        st.error("YOUTUBE_API_KEY is required in real ingestion mode.")
-        st.stop()
-
-    try:
-        videos = discover_youtube_videos(keyword=keyword, max_videos=int(max_videos))
-    except Exception as exc:
-        st.error(f"Discovery failed: {exc}")
-        st.stop()
-
-    for src in videos:
-        source_errors = validate_source(src)
-        if source_errors:
-            validation_errors.extend([f"source:{src.get('source_id', 'unknown')} {err}" for err in source_errors])
-
-    st.subheader("Discovery results")
-    st.dataframe(videos, use_container_width=True)
-
-    csv_preview = "\n".join(
-        ["source_id,source_type,title,channel,url,published_at,duration_seconds"]
-        + [
-            f"{v['source_id']},{v['source_type']},{v['title']},{v['channel']},{v['url']},{v.get('published_at','')},{v.get('duration_seconds','')}"
-            for v in videos
-        ]
-    )
-    st.download_button("Download Sources.csv", data=csv_preview.encode("utf-8"), file_name="Sources.csv", mime="text/csv")
-
-    if discovery_only:
-        st.info("Discovery only is enabled; ingestion stopped after discovery.")
-        st.stop()
-
-    queue = videos[: int(max_videos)]
-    records: list[dict] = []
-    additions_blocks: list[str] = []
-    # Transcript counters track worker retrieval quality; pipeline counters track extraction/validation flow.
-    transcripts_succeeded = 0
-    transcripts_failed = 0
-    pipeline_succeeded = 0
-    pipeline_failed = 0
-    video_diagnostics: list[dict] = []
-
-    for source in queue:
-        video_key = source.get("source_id", "unknown")
-        _log(video_key, "Discovery status: queued")
-
-        try:
-            worker_result = fetch_transcript_via_worker(
-                worker_url=worker_url,
-                worker_api_key=worker_api_key,
-                source_id=video_key,
-                preferred_language="en",
-                allow_audio_fallback=allow_audio_fallback,
-                proxy_enabled=proxy_enabled,
-                proxy_country=proxy_country.strip() or None,
-                proxy_sticky=proxy_sticky,
-                timeout=30,
-            )
-            request_preview = {
-                "source_id": video_key,
-                "preferred_language": "en",
-                "audio_fallback_enabled": bool(allow_audio_fallback),
-                "proxy_enabled": bool(proxy_enabled),
-                "proxy_country": proxy_country.strip() or None,
-                "proxy_sticky": bool(proxy_sticky),
-                "worker_header_included": bool(worker_result.get("header_included")),
+    if st.button("Create Brain"):
+        if not worker_healthy:
+            st.error("Worker must be healthy before creating a Brain.")
+        elif not new_name.strip():
+            st.error("brain_name is required.")
+        else:
+            payload = {
+                "brain_name": new_name.strip(),
+                "brain_type": new_type,
+                "default_keyword": new_default_keyword.strip() or None,
             }
-            st.session_state.request_previews.append(request_preview)
-            payload = worker_result.get("json", {})
-            status_code = worker_result.get("status_code")
-            diagnostics = payload.get("diagnostics", {}) if isinstance(payload, dict) else {}
-            video_diagnostics.append(
+            try:
+                response = worker_request("POST", "/v1/brains", json=payload)
+                if response.ok:
+                    created = response.json()
+                    created_id = created.get("brain_id")
+                    st.success("Brain created.")
+                    fetch_brains()
+                    if created_id:
+                        st.session_state["selected_brain_id"] = created_id
+                    st.rerun()
+                else:
+                    _render_worker_http_error(response)
+            except requests.RequestException as exc:
+                st.error(f"Failed to create brain: {exc}")
+
+selected_brain = next((b for b in brains if b.get("brain_id") == st.session_state.get("selected_brain_id")), None)
+default_keyword = (selected_brain or {}).get("default_keyword") or ""
+
+st.subheader("Ingest Controls")
+keyword = st.text_input("Keyword", value=default_keyword, key="ingest_keyword")
+n_new = st.number_input("N new videos", min_value=1, max_value=500, value=20, step=1)
+
+with st.expander("Longform settings (advanced)"):
+    chunk_seconds = st.number_input("chunk_seconds", min_value=60, max_value=3600, value=600, step=30)
+    overlap_seconds = st.number_input("overlap_seconds", min_value=0, max_value=300, value=15, step=1)
+
+if st.button("Discover + Ingest New Videos", type="primary", disabled=not worker_healthy):
+    brain_id = st.session_state.get("selected_brain_id")
+    if not brain_id:
+        st.error("Please select or create a Brain first.")
+    elif not keyword.strip():
+        st.error("Keyword is required.")
+    else:
+        ingest_payload = {
+            "keyword": keyword.strip(),
+            "n_new": int(n_new),
+            "mode": "audio_first",
+            "longform": {
+                "chunk_seconds": int(chunk_seconds),
+                "overlap_seconds": int(overlap_seconds),
+            },
+        }
+        try:
+            response = worker_request("POST", f"/v1/brains/{brain_id}/ingest", json=ingest_payload)
+            if response.ok:
+                ingest_json = response.json()
+                run_id = ingest_json.get("run_id")
+                if run_id:
+                    st.session_state["run_id"] = run_id
+                    st.session_state["last_report"] = None
+                    st.session_state["brain_pack_id"] = None
+                    st.success(f"Ingest started. run_id={run_id}")
+                else:
+                    st.error(f"Ingest started but run_id missing. Response: {_snippet(response.text)}")
+            else:
+                _render_worker_http_error(response)
+        except requests.RequestException as exc:
+            st.error(f"Failed to start ingest: {exc}")
+
+run_id = st.session_state.get("run_id")
+if run_id:
+    st.subheader("Run Progress")
+    polling_enabled = st.checkbox("Polling", value=True)
+
+    run_data: dict[str, Any] | None = None
+    try:
+        run_response = worker_request("GET", f"/v1/runs/{run_id}")
+        if run_response.ok:
+            run_data = run_response.json()
+        else:
+            _render_worker_http_error(run_response)
+    except requests.RequestException as exc:
+        st.error(f"Failed to fetch run status: {exc}")
+
+    if run_data:
+        status = str(run_data.get("status", "unknown"))
+        selected_new = int(run_data.get("selected_new") or 0)
+        completed = int(run_data.get("completed") or 0)
+
+        col1, col2, col3 = st.columns(3)
+        col1.metric("status", status)
+        col2.metric("candidates_found", int(run_data.get("candidates_found") or 0))
+        col3.metric("selected_new", selected_new)
+
+        col4, col5 = st.columns(2)
+        col4.metric("skipped_duplicates", int(run_data.get("skipped_duplicates") or 0))
+        col5.metric("failed", int(run_data.get("failed") or 0))
+
+        st.metric("completed", completed)
+
+        progress_total = selected_new if selected_new > 0 else 1
+        st.progress(min(completed / progress_total, 1.0))
+
+        current = run_data.get("current") or {}
+        if isinstance(current, dict) and current:
+            st.write(
                 {
-                    "video_id": video_key,
-                    "worker_status_code": status_code,
-                    "worker_diagnostics": diagnostics,
+                    "current.source_id": current.get("source_id"),
+                    "current.stage": current.get("stage"),
+                    "current.detail": current.get("detail"),
                 }
             )
-            _log(video_key, f"Worker response status: {status_code}")
 
-            transcript_text = (payload.get("text") or "").strip() if isinstance(payload, dict) else ""
-            transcript_segments = payload.get("segments") if isinstance(payload, dict) else None
-            has_segments = isinstance(transcript_segments, list) and len(transcript_segments) > 0
-            if status_code != 200 or (not transcript_text and not has_segments):
-                label = payload.get("detail") if isinstance(payload, dict) else None
-                if not label:
-                    label = payload.get("error") if isinstance(payload, dict) else None
-                if not label:
-                    label = payload.get("raw") if isinstance(payload, dict) else "Worker transcript unavailable"
-                raise RuntimeError(f"worker_error: {label}")
+        if status in TERMINAL_RUN_STATES:
+            try:
+                report_response = worker_request("GET", f"/v1/runs/{run_id}/report")
+                if report_response.ok:
+                    st.session_state["last_report"] = report_response.json()
+                else:
+                    _render_worker_http_error(report_response)
+            except requests.RequestException as exc:
+                st.error(f"Failed to fetch report: {exc}")
+        elif polling_enabled:
+            time.sleep(1.5)
+            st.rerun()
 
-            transcript = {
-                "url": source["url"],
-                "video_id": payload.get("video_id") or video_key,
-                "method": payload.get("method", "worker"),
-                "language": payload.get("language"),
-                "segments": transcript_segments or [],
-                "full_text": transcript_text,
-                "diagnostics": diagnostics,
-                "worker_status_code": status_code,
-            }
-            transcript["source"] = source
-            transcript_ok = bool(transcript.get("full_text", "").strip()) or bool(transcript.get("segments"))
-            if transcript_ok:
-                transcripts_succeeded += 1
+report = st.session_state.get("last_report")
+if report:
+    st.subheader("Run Report")
+    st.write(
+        {
+            "ingested_new": report.get("ingested_new"),
+            "transcripts_succeeded": report.get("transcripts_succeeded"),
+            "transcripts_failed": report.get("transcripts_failed"),
+            "total_audio_minutes": report.get("total_audio_minutes"),
+        }
+    )
+
+    existing_pack_id = report.get("brain_pack_id")
+    if existing_pack_id:
+        download_url = f"{worker_url.rstrip('/')}/v1/brain-packs/{existing_pack_id}/download"
+        st.link_button("Download Brain Pack", download_url)
+    else:
+        st.info("No brain_pack_id in report yet.")
+        if st.button("Build Brain Pack"):
+            run_id_for_pack = st.session_state.get("run_id")
+            if not run_id_for_pack:
+                st.error("Missing run_id.")
             else:
-                transcripts_failed += 1
-                per_video_errors.append(f"{video_key}: transcript_failed: transcript_empty")
-                _log(video_key, "Transcript empty; marking transcript_failed")
-                continue
-            _log(video_key, f"Transcript method used: {transcript.get('method')}")
-            _log(video_key, f"Transcript diagnostics: {json.dumps(diagnostics, ensure_ascii=False)}")
-        except Exception as exc:
-            transcripts_failed += 1
-            err = f"transcription:{video_key} {exc}"
-            runtime_errors.append(err)
-            per_video_errors.append(f"{video_key}: transcript_failed: {exc}")
-            _log(video_key, f"Transcript failed: {exc}")
-            continue
+                try:
+                    build_response = worker_request("POST", f"/v1/runs/{run_id_for_pack}/brain-pack")
+                    if build_response.ok:
+                        build_json = build_response.json()
+                        st.session_state["brain_pack_id"] = build_json.get("brain_pack_id")
+                    else:
+                        _render_worker_http_error(build_response)
+                except requests.RequestException as exc:
+                    st.error(f"Failed to start brain pack build: {exc}")
 
-        try:
-            source_records, additions_md = extract_brain_records(
-                brain="BD_Brain",
-                keyword=keyword,
-                source=source,
-                transcript=transcript,
-                use_openai=use_openai_extraction and openai_api_key_present,
-            )
-            additions_blocks.append(additions_md)
-            _log(video_key, f"Extraction counts: {len(source_records)}")
-            pipeline_succeeded += 1
-        except Exception as exc:
-            pipeline_failed += 1
-            err = f"extraction:{video_key} {exc}"
-            runtime_errors.append(err)
-            per_video_errors.append(f"{video_key}: extract_failed: {exc}")
-            _log(video_key, f"Extraction failed: {exc}")
-            continue
-
-        for rec in source_records:
-            record_errors = validate_record(rec)
-            if record_errors:
-                validation_errors.extend([f"record:{rec.get('id', 'unknown')} {err}" for err in record_errors])
-        records.extend(source_records)
-
-    run_metadata = {
-        "run_id": f"run_{uuid4().hex[:8]}",
-        "keyword": keyword,
-        "started_at": started_at,
-        "ended_at": now_iso(),
-        "config": {
-            "max_videos": int(max_videos),
-            "discovery_only": discovery_only,
-            "use_openai_extraction": use_openai_extraction,
-            "allow_audio_fallback": allow_audio_fallback,
-            "use_decodo_proxy": proxy_enabled,
-            "decodo_sticky_per_video": proxy_sticky,
-            "decodo_country": proxy_country.strip() or None,
-            "worker_url": worker_url or None,
-        },
-        "errors": runtime_errors,
-        "video_diagnostics": video_diagnostics,
-        "env": {
-            "python_version": platform.python_version(),
-            "platform": platform.platform(),
-            "has_youtube_api_key": bool(os.getenv("YOUTUBE_API_KEY")),
-        },
-    }
-    validation_errors.extend([f"run_metadata {err}" for err in validate_run_metadata(run_metadata)])
-
-    pack_slug = slugify(keyword)
-    pack_name = f"{started_at[:10]}__{pack_slug}__pack_v1"
-    pack_dir = Path(__file__).resolve().parents[1] / "BD_Brain" / "Packs" / pack_name
-
-    outputs = {
-        "Brain_Additions.md": "Brain_Additions.md",
-        "Brain_Core.jsonl": "Brain_Core.jsonl",
-        "Brain_Diff.md": "Brain_Diff.md",
-        "Sources.csv": "Sources.csv",
-        "Run_Metadata.json": "Run_Metadata.json",
-    }
-
-    manifest = {
-        "pack_id": pack_name,
-        "brain": "BD_Brain",
-        "keyword": keyword,
-        "created_at": now_iso(),
-        "sources": queue,
-        "outputs": outputs,
-        "stats": {
-            "videos_discovered": len(videos),
-            "videos_queued": len(queue),
-            "records_extracted": len(records),
-        },
-    }
-    validation_errors.extend([f"pack_manifest {err}" for err in validate_pack_manifest(manifest)])
-
-    validation_status = "passed" if not validation_errors else "failed"
-    for source in queue:
-        _log(source.get("source_id", "unknown"), f"Validation status: {validation_status}")
-
-    st.info(
-        f"Transcripts succeeded: {transcripts_succeeded} | Transcripts failed: {transcripts_failed} | "
-        f"Pipeline succeeded: {pipeline_succeeded} | Pipeline failed: {pipeline_failed}"
-    )
-    st.caption("Transcript counts reflect worker transcript retrieval. Pipeline counts reflect extraction + validation.")
-    if per_video_errors:
-        st.subheader("Per-video errors")
-        for err in per_video_errors:
-            st.write(f"- {err}")
-
-    with st.expander("Transcript diagnostics", expanded=False):
-        st.json(
-            {
-                "worker_url_present": bool(worker_url),
-                "worker_api_key_present": bool((worker_api_key or "").strip()),
-                "worker_api_key_stripped_length": len((worker_api_key or "").strip()),
-                "worker_api_key_last4": (worker_api_key or "").strip()[-4:] if len((worker_api_key or "").strip()) >= 4 else "",
-                "worker_header_included": bool((worker_api_key or "").strip()),
-                "transcripts_succeeded": transcripts_succeeded,
-                "transcripts_failed": transcripts_failed,
-                "pipeline_succeeded": pipeline_succeeded,
-                "pipeline_failed": pipeline_failed,
-                "video_diagnostics": video_diagnostics,
-            }
-        )
-
-    if validation_errors:
-        st.error("Validation failed. Brain Pack was not written.")
-        for err in validation_errors:
-            st.write(f"- {err}")
-        st.stop()
-
-    if not records:
-        st.warning("No transcripts/extractions succeeded; pack not created.")
-        st.stop()
-
-    pack_dir.mkdir(parents=True, exist_ok=True)
-    additions_text = "# Brain Additions\n\n" + "\n\n".join(additions_blocks)
-    diff_text = (
-        "# Brain Diff\n\n"
-        f"- Sources: {len(queue)}\n"
-        f"- Records extracted: {len(records)}\n"
-        f"- Keyword: {keyword}\n"
-    )
-
-    write_jsonl(pack_dir / "Brain_Core.jsonl", records)
-    write_sources_csv(pack_dir / "Sources.csv", queue)
-    write_json(pack_dir / "Run_Metadata.json", run_metadata)
-    write_json(pack_dir / "Pack_Manifest.json", manifest)
-    write_json(pack_dir / "pack_manifest.json", manifest)
-    (pack_dir / "Brain_Additions.md").write_text(additions_text, encoding="utf-8")
-    (pack_dir / "Brain_Diff.md").write_text(diff_text, encoding="utf-8")
-
-    pack_files = {
-        "Brain_Additions.md": additions_text,
-        "Brain_Core.jsonl": "\n".join(json.dumps(r, ensure_ascii=False) for r in records) + "\n",
-        "Brain_Diff.md": diff_text,
-        "Sources.csv": (pack_dir / "Sources.csv").read_text(encoding="utf-8"),
-        "Run_Metadata.json": (pack_dir / "Run_Metadata.json").read_text(encoding="utf-8"),
-        "pack_manifest.json": (pack_dir / "pack_manifest.json").read_text(encoding="utf-8"),
-    }
-    zip_bytes = build_pack_zip(pack_files)
-
-    st.success(f"Generated Brain Pack at: {pack_dir}")
-    st.download_button(
-        "Download Brain Pack (.zip)",
-        data=zip_bytes,
-        file_name=f"{pack_name}.zip",
-        mime="application/zip",
-    )
-
-    with st.expander("Advanced logs", expanded=False):
-        st.markdown("**Request preview (sanitized)**")
-        st.json(st.session_state.request_previews)
-        for entry in st.session_state.advanced_logs:
-            st.write(f"[{entry['video']}] {entry['message']}")
+pack_id = st.session_state.get("brain_pack_id")
+if pack_id:
+    st.subheader("Brain Pack Status")
+    poll_pack = st.checkbox("Polling brain pack status", value=True)
+    try:
+        pack_response = worker_request("GET", f"/v1/brain-packs/{pack_id}")
+        if pack_response.ok:
+            pack = pack_response.json()
+            pack_status = str(pack.get("status", "unknown"))
+            st.write({"brain_pack_id": pack_id, "status": pack_status})
+            if pack_status == "completed":
+                st.link_button("Download Brain Pack", f"{worker_url.rstrip('/')}/v1/brain-packs/{pack_id}/download")
+            elif poll_pack:
+                time.sleep(1.5)
+                st.rerun()
+        else:
+            _render_worker_http_error(pack_response)
+    except requests.RequestException as exc:
+        st.error(f"Failed to fetch brain pack status: {exc}")
