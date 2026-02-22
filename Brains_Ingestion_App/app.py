@@ -257,8 +257,11 @@ if st.button("Generate Brain Pack", type="primary"):
     queue = videos[: int(max_videos)]
     records: list[dict] = []
     additions_blocks: list[str] = []
-    successful_sources = 0
-    failed_sources = 0
+    # Transcript counters track worker retrieval quality; pipeline counters track extraction/validation flow.
+    transcripts_succeeded = 0
+    transcripts_failed = 0
+    pipeline_succeeded = 0
+    pipeline_failed = 0
     video_diagnostics: list[dict] = []
 
     for source in queue:
@@ -321,13 +324,21 @@ if st.button("Generate Brain Pack", type="primary"):
                 "worker_status_code": status_code,
             }
             transcript["source"] = source
+            transcript_ok = bool(transcript.get("full_text", "").strip()) or bool(transcript.get("segments"))
+            if transcript_ok:
+                transcripts_succeeded += 1
+            else:
+                transcripts_failed += 1
+                per_video_errors.append(f"{video_key}: transcript_failed: transcript_empty")
+                _log(video_key, "Transcript empty; marking transcript_failed")
+                continue
             _log(video_key, f"Transcript method used: {transcript.get('method')}")
             _log(video_key, f"Transcript diagnostics: {json.dumps(diagnostics, ensure_ascii=False)}")
         except Exception as exc:
-            failed_sources += 1
+            transcripts_failed += 1
             err = f"transcription:{video_key} {exc}"
             runtime_errors.append(err)
-            per_video_errors.append(f"{video_key}: {exc}")
+            per_video_errors.append(f"{video_key}: transcript_failed: {exc}")
             _log(video_key, f"Transcript failed: {exc}")
             continue
 
@@ -341,12 +352,12 @@ if st.button("Generate Brain Pack", type="primary"):
             )
             additions_blocks.append(additions_md)
             _log(video_key, f"Extraction counts: {len(source_records)}")
-            successful_sources += 1
+            pipeline_succeeded += 1
         except Exception as exc:
-            failed_sources += 1
+            pipeline_failed += 1
             err = f"extraction:{video_key} {exc}"
             runtime_errors.append(err)
-            per_video_errors.append(f"{video_key}: {exc}")
+            per_video_errors.append(f"{video_key}: extract_failed: {exc}")
             _log(video_key, f"Extraction failed: {exc}")
             continue
 
@@ -412,7 +423,11 @@ if st.button("Generate Brain Pack", type="primary"):
     for source in queue:
         _log(source.get("source_id", "unknown"), f"Validation status: {validation_status}")
 
-    st.info(f"Sources succeeded: {successful_sources} | Sources failed: {failed_sources}")
+    st.info(
+        f"Transcripts succeeded: {transcripts_succeeded} | Transcripts failed: {transcripts_failed} | "
+        f"Pipeline succeeded: {pipeline_succeeded} | Pipeline failed: {pipeline_failed}"
+    )
+    st.caption("Transcript counts reflect worker transcript retrieval. Pipeline counts reflect extraction + validation.")
     if per_video_errors:
         st.subheader("Per-video errors")
         for err in per_video_errors:
@@ -426,6 +441,10 @@ if st.button("Generate Brain Pack", type="primary"):
                 "worker_api_key_stripped_length": len((worker_api_key or "").strip()),
                 "worker_api_key_last4": (worker_api_key or "").strip()[-4:] if len((worker_api_key or "").strip()) >= 4 else "",
                 "worker_header_included": bool((worker_api_key or "").strip()),
+                "transcripts_succeeded": transcripts_succeeded,
+                "transcripts_failed": transcripts_failed,
+                "pipeline_succeeded": pipeline_succeeded,
+                "pipeline_failed": pipeline_failed,
                 "video_diagnostics": video_diagnostics,
             }
         )
