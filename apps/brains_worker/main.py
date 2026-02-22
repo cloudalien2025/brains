@@ -27,6 +27,8 @@ logger = logging.getLogger(__name__)
 
 ALLOWED_STT_MODELS = {"gpt-4o-mini-transcribe", "gpt-4o-transcribe", "whisper-1"}
 HTTPStatusValue = int | str
+
+# Hard limit for yt-dlp subtitle extraction so the worker can respond within Streamlit's 30s timeout.
 YTDLP_SUBS_TIMEOUT_S = int(os.getenv("BRAINS_YTDLP_SUBS_TIMEOUT_S", "12"))
 
 
@@ -103,7 +105,10 @@ def _expected_api_key() -> str:
 
 
 def _auth_error() -> JSONResponse:
-    return JSONResponse(status_code=401, content={"error_code": "WORKER_AUTH_FAILED", "error": "Missing or invalid x-api-key", "diagnostics": {}})
+    return JSONResponse(
+        status_code=401,
+        content={"error_code": "WORKER_AUTH_FAILED", "error": "Missing or invalid x-api-key", "diagnostics": {}},
+    )
 
 
 def _error(status_code: int, code: str, message: str, diagnostics: dict[str, Any]) -> JSONResponse:
@@ -115,30 +120,39 @@ def _error(status_code: int, code: str, message: str, diagnostics: dict[str, Any
 def _build_proxy_url(payload: TranscriptRequest, video_id: str) -> str | None:
     if payload.proxy_url:
         return payload.proxy_url
+
     proxy_manager = ProxyManager()
     try:
         managed = proxy_manager.get_proxies(proxy_session_key=video_id)
         managed_url = (managed or {}).get("https") or (managed or {}).get("http")
     except Exception:
         managed_url = None
+
     if payload.proxy_enabled is False:
         return None
+
+    # If ProxyManager provided a proxy and proxy_enabled is not explicitly True, prefer managed proxy.
     if managed_url and payload.proxy_enabled is not True:
         return managed_url
+
     enabled_flag = payload.proxy_enabled is True or (os.getenv("BRAINS_PROXY_ENABLED") or "").strip().lower() in {"1", "true", "yes", "on"}
     if not enabled_flag:
         return managed_url
+
     host = (os.getenv("DECODO_HOST") or os.getenv("DECDO_HOST") or "").strip() or "gate.decodo.com"
     port = (os.getenv("DECODO_PORT") or os.getenv("DECDO_PORT") or "").strip() or "7000"
     username = (os.getenv("DECODO_USERNAME") or os.getenv("DECDO_USERNAME") or "").strip()
     password = (os.getenv("DECODO_PASSWORD") or os.getenv("DECDO_PASSWORD") or "").strip()
     if not (username and password):
         return managed_url
+
     if payload.proxy_country:
         username = f"{username}-country-{payload.proxy_country.lower()}"
+
     if payload.proxy_sticky:
         safe_session = "".join(ch for ch in video_id if ch.isalnum())[:24] or "sticky"
         username = f"{username}-session-{safe_session}"
+
     return f"http://{username}:{password}@{host}:{port}"
 
 
@@ -155,6 +169,7 @@ def _extract_video_id(video_id: str | None, source_id: str | None, url: str | No
             break
         if re.match(r"^[A-Za-z0-9_-]{6,}$", cleaned):
             return cleaned
+
     if url:
         parsed = urlparse(url.strip())
         host = parsed.netloc.lower()
@@ -165,6 +180,7 @@ def _extract_video_id(video_id: str | None, source_id: str | None, url: str | No
         qv = (parse_qs(parsed.query).get("v") or [""])[0]
         if re.match(r"^[A-Za-z0-9_-]{6,}$", qv):
             return qv
+
     return ""
 
 
@@ -172,18 +188,22 @@ def _youtube_watch_player_json(video_id: str, proxy: str | None) -> tuple[HTTPSt
     proxies = {"http": proxy, "https": proxy} if proxy else None
     url = f"https://www.youtube.com/watch?v={video_id}&hl=en"
     try:
-        response = requests.get(url, timeout=20, proxies=proxies, headers={"User-Agent": "Mozilla/5.0"})
+        # Keep this lower so captions stage can't eat the full Streamlit budget.
+        response = requests.get(url, timeout=10, proxies=proxies, headers={"User-Agent": "Mozilla/5.0"})
         status = response.status_code
         if status in {429, 403}:
             return status, None, "PLAYER_JSON_BLOCKED"
         if status != 200:
             return status, None, "PLAYER_JSON_FETCH_FAILED"
+
         text = response.text or ""
         if "consent.youtube.com" in text:
             return status, None, "PLAYER_JSON_CONSENT_REQUIRED"
+
         match = re.search(r"ytInitialPlayerResponse\s*=\s*(\{.+?\})\s*;", text)
         if not match:
             return status, None, "PLAYER_JSON_MISSING"
+
         return status, json.loads(match.group(1)), None
     except Exception:
         return "exception", None, "PLAYER_JSON_EXCEPTION"
@@ -194,20 +214,25 @@ def _choose_caption_track(tracks: list[dict[str, Any]], preferred_language: str 
         return None
     pref = (preferred_language or "").lower()
 
-    def rank(track: dict[str, Any]) -> tuple[int, int, str]:
+    def rank(track: dict[str, Any]) -> tuple[int, int, int]:
         lang = (track.get("languageCode") or "").lower()
         exact = 0 if pref and (lang == pref or lang.startswith(f"{pref}-")) else 1
         english = 0 if lang.startswith("en") else 1
-        auto = 1 if (track.get("kind") == "asr") else 0
+        auto = 1 if (track.get("kind") == "asr") else 0  # prefer human captions over ASR
         return exact, english, auto
 
     return sorted(tracks, key=rank)[0]
 
 
 def _strip_caption_markup(text: str) -> str:
+    # Remove common WebVTT/YouTube caption tags (best effort).
     text = re.sub(r"</?(?:c|v|lang|ruby|rt|b|i|u)(?:\.[^>\s]+)?[^>]*>", " ", text, flags=re.IGNORECASE)
     text = re.sub(r"<[^>]+>", " ", text)
+
+    # Unescape HTML entities (&amp; etc.), including numeric ones.
     text = html.unescape(text.replace("\xa0", " "))
+
+    # Normalize whitespace.
     text = re.sub(r"\s+", " ", text)
     return text.strip()
 
@@ -216,27 +241,46 @@ def _parse_subtitle_to_text(raw: str, ext: str) -> str:
     content = raw.strip()
     if not content:
         return ""
+
+    # Auto-detect XML/TTML even if fmt/ext claims vtt (seen in the wild).
+    if "<tt" in content or "<transcript" in content:
+        ext = "xml"
+
     lines: list[str] = []
+
     if ext == "vtt":
+        # Skip NOTE/STYLE/REGION blocks properly.
         block_mode: str | None = None
         for line in content.splitlines():
             stripped = line.strip()
             upper = stripped.upper()
+
             if block_mode:
                 if not stripped:
                     block_mode = None
                 continue
+
             if not stripped or upper == "WEBVTT":
                 continue
+
             if upper.startswith(("NOTE", "STYLE", "REGION")):
                 block_mode = upper.split(maxsplit=1)[0]
                 continue
+
+            # YouTube sometimes includes these in VTT downloads.
+            if stripped.startswith(("Kind:", "Language:")):
+                continue
+
+            # Skip cue timing and numeric cue identifiers.
             if "-->" in stripped or stripped.isdigit():
                 continue
+
             parsed_line = _strip_caption_markup(stripped)
             if parsed_line:
                 lines.append(parsed_line)
+
         return re.sub(r"\s+", " ", " ".join(lines)).strip()
+
     if ext == "srt":
         for line in content.splitlines():
             stripped = line.strip()
@@ -246,6 +290,7 @@ def _parse_subtitle_to_text(raw: str, ext: str) -> str:
             if parsed_line:
                 lines.append(parsed_line)
         return re.sub(r"\s+", " ", " ".join(lines)).strip()
+
     if ext in {"ttml", "xml"}:
         try:
             root = ET.fromstring(content)
@@ -256,13 +301,15 @@ def _parse_subtitle_to_text(raw: str, ext: str) -> str:
             return re.sub(r"\s+", " ", " ".join(lines)).strip()
         except ET.ParseError:
             return ""
+
     return ""
 
 
 def _download_text(url: str, proxy: str | None) -> tuple[HTTPStatusValue, str | None]:
     proxies = {"http": proxy, "https": proxy} if proxy else None
     try:
-        response = requests.get(url, timeout=20, proxies=proxies, headers={"User-Agent": "Mozilla/5.0"})
+        # Keep this lower so caption downloads can't eat the full Streamlit budget.
+        response = requests.get(url, timeout=10, proxies=proxies, headers={"User-Agent": "Mozilla/5.0"})
         if response.status_code != 200:
             return response.status_code, None
         return response.status_code, response.text
@@ -281,12 +328,15 @@ def _run_ytdlp_subtitles(youtube_url: str, preferred_language: str | None, proxy
         "ytdlp_subs_file_bytes": 0,
         "ytdlp_subs_file_path": None,
     }
+
     yt_dlp = shutil.which("yt-dlp")
     if not yt_dlp:
         diag["ytdlp_subs_error_code"] = "YTDLP_SUBS_FAILED"
         diag["ytdlp_subs_elapsed_ms"] = int((time.perf_counter() - start) * 1000)
         return None, diag
+
     langs = ",".join([p for p in [preferred_language, "en.*"] if p])
+
     cmd = [
         yt_dlp,
         "--skip-download",
@@ -296,12 +346,23 @@ def _run_ytdlp_subtitles(youtube_url: str, preferred_language: str | None, proxy
         langs or "en.*",
         "--sub-format",
         "vtt/srt/ttml/best",
+        # Force fast-fail behavior under gating/proxy issues
+        "--retries",
+        "1",
+        "--fragment-retries",
+        "1",
+        "--extractor-retries",
+        "1",
+        "--socket-timeout",
+        "10",
         "-o",
         str(work_dir / "%(id)s.%(ext)s"),
         youtube_url,
     ]
+
     if proxy:
         cmd.extend(["--proxy", proxy])
+
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=YTDLP_SUBS_TIMEOUT_S)
     except subprocess.TimeoutExpired:
@@ -315,6 +376,7 @@ def _run_ytdlp_subtitles(youtube_url: str, preferred_language: str | None, proxy
         return None, diag
 
     diag["ytdlp_subs_elapsed_ms"] = int((time.perf_counter() - start) * 1000)
+
     if proc.returncode != 0:
         diag["ytdlp_subs_error_code"] = "YTDLP_SUBS_FAILED"
         return None, diag
@@ -334,7 +396,10 @@ def _run_ytdlp_subtitles(youtube_url: str, preferred_language: str | None, proxy
         return auto, lang_match, english
 
     selected = sorted(files, key=score)[0]
-    text = _parse_subtitle_to_text(selected.read_text(encoding="utf-8", errors="ignore"), selected.suffix.lower().lstrip("."))
+    text = _parse_subtitle_to_text(
+        selected.read_text(encoding="utf-8", errors="ignore"),
+        selected.suffix.lower().lstrip("."),
+    )
     if not text:
         diag["ytdlp_subs_error_code"] = "SUBTITLE_PARSE_FAILED"
         return None, diag
@@ -345,6 +410,7 @@ def _run_ytdlp_subtitles(youtube_url: str, preferred_language: str | None, proxy
     diag["ytdlp_subs_lang"] = next((part for part in selected.stem.split(".") if len(part) in {2, 5} and part[:2].isalpha()), None)
     diag["ytdlp_subs_format"] = selected.suffix.lower().lstrip(".")
     diag["ytdlp_subs_file_path"] = str(selected)
+
     return text, diag
 
 
@@ -362,6 +428,7 @@ def _download_audio(youtube_url: str, proxy: str | None, work_dir: Path) -> tupl
     if not yt_dlp:
         diag["audio_download_error_code"] = "YTDLP_AUDIO_DOWNLOAD_FAILED"
         return None, diag
+
     cmd = [
         yt_dlp,
         "--no-playlist",
@@ -376,25 +443,31 @@ def _download_audio(youtube_url: str, proxy: str | None, work_dir: Path) -> tupl
     ]
     if proxy:
         cmd.extend(["--proxy", proxy])
+
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
     except Exception:
         diag["audio_download_elapsed_ms"] = int((time.perf_counter() - start) * 1000)
         diag["audio_download_error_code"] = "YTDLP_AUDIO_DOWNLOAD_FAILED"
         return None, diag
+
     diag["audio_download_elapsed_ms"] = int((time.perf_counter() - start) * 1000)
+
     if proc.returncode != 0:
         diag["audio_download_error_code"] = "YTDLP_AUDIO_DOWNLOAD_FAILED"
         return None, diag
+
     candidates = sorted([p for p in work_dir.glob("*.*") if p.suffix.lower().lstrip(".") in {"mp3", "m4a", "webm", "opus"}])
     if not candidates:
         diag["audio_download_error_code"] = "YTDLP_AUDIO_DOWNLOAD_FAILED"
         return None, diag
+
     audio_path = candidates[0]
     diag["audio_download_status"] = "success"
     diag["audio_file_ext"] = audio_path.suffix.lower().lstrip(".")
     diag["audio_file_bytes"] = audio_path.stat().st_size
     diag["audio_file_path"] = str(audio_path)
+
     return audio_path, diag
 
 
@@ -409,19 +482,23 @@ def _transcribe_openai(audio_path: Path, model: str, language: str | None, promp
         "stt_elapsed_ms": 0,
         "transcript_chars": 0,
     }
+
     api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
     if not api_key:
         diag["stt_error_code"] = "OPENAI_KEY_MISSING"
         return None, diag, 500, "OPENAI_KEY_MISSING", "OpenAI API key is missing"
+
     if model not in ALLOWED_STT_MODELS:
         model = "gpt-4o-mini-transcribe"
         diag["stt_model"] = model
+
     headers = {"Authorization": f"Bearer {api_key}"}
     data: dict[str, str] = {"model": model}
     if language:
         data["language"] = language
     if prompt:
         data["prompt"] = prompt
+
     mime = "audio/mpeg" if audio_path.suffix.lower() == ".mp3" else "audio/mp4"
     try:
         with audio_path.open("rb") as handle:
@@ -438,17 +515,21 @@ def _transcribe_openai(audio_path: Path, model: str, language: str | None, promp
         return None, diag, 503, "OPENAI_STT_FAILED", "OpenAI transcription failed"
 
     diag["stt_elapsed_ms"] = int((time.perf_counter() - start) * 1000)
+
     if resp.status_code == 429:
         diag["stt_error_code"] = "OPENAI_RATE_LIMIT"
         return None, diag, 503, "OPENAI_RATE_LIMIT", "OpenAI rate limit"
+
     if resp.status_code != 200:
         diag["stt_error_code"] = "OPENAI_STT_FAILED"
         logger.error("openai stt failed: %s", _tail(resp.text))
         return None, diag, 503, "OPENAI_STT_FAILED", "OpenAI transcription failed"
+
     text = (resp.json().get("text") or "").strip()
     if not text:
         diag["stt_error_code"] = "OPENAI_STT_FAILED"
         return None, diag, 503, "OPENAI_STT_FAILED", "OpenAI transcription returned empty transcript"
+
     diag["stt_status"] = "success"
     diag["transcript_chars"] = len(text)
     return text, diag, 200, None, None
@@ -549,8 +630,10 @@ def transcript(payload: TranscriptRequest, x_api_key: str | None = Header(defaul
             status, player, player_err = _youtube_watch_player_json(canonical_id, proxy_url)
             diagnostics["player_json_http_status"] = status
             diagnostics["player_json_error_code"] = player_err
+
             tracks = ((player or {}).get("captions") or {}).get("playerCaptionsTracklistRenderer", {}).get("captionTracks", [])
             diagnostics["caption_tracks_found"] = len(tracks)
+
             if tracks:
                 best = _choose_caption_track(tracks, preferred_language)
                 if best:
@@ -576,6 +659,7 @@ def transcript(payload: TranscriptRequest, x_api_key: str | None = Header(defaul
                             diagnostics["caption_parse_status"] = "failed"
                         else:
                             diagnostics["caption_parse_status"] = "failed"
+
             if diagnostics["caption_parse_status"] == "skipped" and diagnostics["caption_tracks_found"] == 0:
                 diagnostics["caption_download_http_status"] = "exception"
         else:
@@ -588,25 +672,30 @@ def transcript(payload: TranscriptRequest, x_api_key: str | None = Header(defaul
             diagnostics.update(diag)
             if payload.debug_include_artifact_paths is False:
                 diagnostics["ytdlp_subs_file_path"] = None
+
             if text:
                 diagnostics["pipeline_stage_success"] = "subs_ytdlp"
                 diagnostics["transcript_chars"] = len(text)
                 diagnostics["elapsed_ms_total"] = int((time.perf_counter() - started) * 1000)
                 return {"video_id": canonical_id, "transcript_source": "subs_ytdlp", "transcript_text": text, "diagnostics": diagnostics}
 
+        # If we reach here: no captions/subtitles were produced.
         if not fallback_enabled:
             diagnostics["elapsed_ms_total"] = int((time.perf_counter() - started) * 1000)
             return _error(422, "NO_CAPTIONS_AND_FALLBACK_DISABLED", "No captions/subtitles found and audio fallback disabled", diagnostics)
 
         diagnostics["pipeline_stage_attempts"].append("audio_openai_stt")
         diagnostics["audio_fallback_attempted"] = True
+
         audio_path, audio_diag = _download_audio(youtube_url, proxy_url, work_dir)
         diagnostics.update(audio_diag)
         if payload.debug_include_artifact_paths is False:
             diagnostics["audio_file_path"] = None
+
         if not audio_path:
             diagnostics["elapsed_ms_total"] = int((time.perf_counter() - started) * 1000)
             return _error(502, "YTDLP_AUDIO_DOWNLOAD_FAILED", "yt-dlp audio download failed", diagnostics)
+
         text, stt_diag, status_code, err_code, err_message = _transcribe_openai(audio_path, payload.stt_model, payload.stt_language, payload.stt_prompt)
         diagnostics.update(stt_diag)
         if not text:
@@ -617,10 +706,12 @@ def transcript(payload: TranscriptRequest, x_api_key: str | None = Header(defaul
         diagnostics["transcript_chars"] = len(text)
         diagnostics["elapsed_ms_total"] = int((time.perf_counter() - started) * 1000)
         return {"video_id": canonical_id, "transcript_source": "audio_openai_stt", "transcript_text": text, "diagnostics": diagnostics}
+
     except Exception:
         logger.exception("unexpected error")
         diagnostics["elapsed_ms_total"] = int((time.perf_counter() - started) * 1000)
         return _error(500, "UNEXPECTED_SERVER_ERROR", "Unexpected server error", diagnostics)
+
     finally:
         if not payload.debug_keep_files:
             shutil.rmtree(work_dir, ignore_errors=True)
