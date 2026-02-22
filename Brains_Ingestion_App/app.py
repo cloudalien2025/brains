@@ -8,7 +8,7 @@ import streamlit as st
 from streamlit.errors import StreamlitSecretNotFoundError
 
 
-TERMINAL_RUN_STATES = {"completed", "completed_with_errors", "failed"}
+TERMINAL_RUN_STATES = {"completed", "completed_with_errors", "failed", "success", "partial_success", "no_captions", "blocked"}
 WORKER_DEFAULT_TIMEOUT = 90
 
 
@@ -210,6 +210,9 @@ with st.expander("Create Brain", expanded=not bool(brains)):
 with st.expander("Create Brain debug", expanded=False):
     st.write({"last_create_brain_payload": st.session_state.get("last_create_brain_payload")})
 
+with st.expander("Ingest debug", expanded=False):
+    st.write({"last_ingest_payload": st.session_state.get("last_ingest_payload")})
+
 selected_brain = next((b for b in brains if b.get("brain_id") == st.session_state.get("selected_brain_id")), None)
 default_keyword = (selected_brain or {}).get("default_keyword") or ""
 
@@ -230,6 +233,7 @@ if st.button("Discover + Ingest New Videos", type="primary", disabled=not worker
     else:
         ingest_payload = {
             "keyword": keyword.strip(),
+            "selected_new": int(n_new),
             "n_new_videos": int(n_new),
             "max_candidates": 50,
             "mode": "audio_first",
@@ -238,6 +242,8 @@ if st.button("Discover + Ingest New Videos", type="primary", disabled=not worker
                 "overlap_seconds": int(overlap_seconds),
             },
         }
+        st.session_state["last_ingest_payload"] = ingest_payload
+        st.write({"ingest_payload": ingest_payload})
         try:
             response = worker_request("POST", f"/v1/brains/{brain_id}/ingest", json=ingest_payload)
             if response.ok:
