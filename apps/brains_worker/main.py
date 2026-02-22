@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import html
 import logging
 import os
 import re
@@ -26,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 ALLOWED_STT_MODELS = {"gpt-4o-mini-transcribe", "gpt-4o-transcribe", "whisper-1"}
 HTTPStatusValue = int | str
+YTDLP_SUBS_TIMEOUT_S = int(os.getenv("BRAINS_YTDLP_SUBS_TIMEOUT_S", "12"))
 
 
 class TranscriptRequest(BaseModel):
@@ -203,8 +205,9 @@ def _choose_caption_track(tracks: list[dict[str, Any]], preferred_language: str 
 
 
 def _strip_caption_markup(text: str) -> str:
+    text = re.sub(r"</?(?:c|v|lang|ruby|rt|b|i|u)(?:\.[^>\s]+)?[^>]*>", " ", text, flags=re.IGNORECASE)
     text = re.sub(r"<[^>]+>", " ", text)
-    text = text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+    text = html.unescape(text.replace("\xa0", " "))
     text = re.sub(r"\s+", " ", text)
     return text.strip()
 
@@ -214,12 +217,34 @@ def _parse_subtitle_to_text(raw: str, ext: str) -> str:
     if not content:
         return ""
     lines: list[str] = []
-    if ext in {"vtt", "srt"}:
+    if ext == "vtt":
+        block_mode: str | None = None
         for line in content.splitlines():
             stripped = line.strip()
-            if not stripped or stripped.upper() == "WEBVTT" or stripped.isdigit() or "-->" in stripped:
+            upper = stripped.upper()
+            if block_mode:
+                if not stripped:
+                    block_mode = None
                 continue
-            lines.append(_strip_caption_markup(stripped))
+            if not stripped or upper == "WEBVTT":
+                continue
+            if upper.startswith(("NOTE", "STYLE", "REGION")):
+                block_mode = upper.split(maxsplit=1)[0]
+                continue
+            if "-->" in stripped or stripped.isdigit():
+                continue
+            parsed_line = _strip_caption_markup(stripped)
+            if parsed_line:
+                lines.append(parsed_line)
+        return re.sub(r"\s+", " ", " ".join(lines)).strip()
+    if ext == "srt":
+        for line in content.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.isdigit() or "-->" in stripped:
+                continue
+            parsed_line = _strip_caption_markup(stripped)
+            if parsed_line:
+                lines.append(parsed_line)
         return re.sub(r"\s+", " ", " ".join(lines)).strip()
     if ext in {"ttml", "xml"}:
         try:
@@ -278,7 +303,12 @@ def _run_ytdlp_subtitles(youtube_url: str, preferred_language: str | None, proxy
     if proxy:
         cmd.extend(["--proxy", proxy])
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=YTDLP_SUBS_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        diag["ytdlp_subs_status"] = "timeout"
+        diag["ytdlp_subs_error_code"] = "YTDLP_TIMEOUT"
+        diag["ytdlp_subs_elapsed_ms"] = int((time.perf_counter() - start) * 1000)
+        return None, diag
     except Exception:
         diag["ytdlp_subs_error_code"] = "YTDLP_SUBS_FAILED"
         diag["ytdlp_subs_elapsed_ms"] = int((time.perf_counter() - start) * 1000)
@@ -481,6 +511,13 @@ def transcript_version() -> dict[str, Any]:
 
 @app.post("/transcript")
 def transcript(payload: TranscriptRequest, x_api_key: str | None = Header(default=None, alias="x-api-key"), x_api_key_2: str | None = Header(default=None, alias="X-Api-Key")) -> Any:
+    # Manual validation plan for fast-fail + robust captions:
+    # 1) Pick a video with known auto-generated captions.
+    # 2) POST /transcript with audio_fallback_enabled=false.
+    # 3) Confirm response completes in <30s.
+    # 4) Confirm transcript_source="captions_player_json" and caption_parse_status="success".
+    # 5) Test a video with no captions and verify yt-dlp times out in ~BRAINS_YTDLP_SUBS_TIMEOUT_S,
+    #    then returns 422 NO_CAPTIONS_AND_FALLBACK_DISABLED (not 502) when fallback disabled.
     expected_key = _expected_api_key()
     provided = (x_api_key or x_api_key_2 or "").strip()
     if expected_key and provided != expected_key:
@@ -556,9 +593,6 @@ def transcript(payload: TranscriptRequest, x_api_key: str | None = Header(defaul
                 diagnostics["transcript_chars"] = len(text)
                 diagnostics["elapsed_ms_total"] = int((time.perf_counter() - started) * 1000)
                 return {"video_id": canonical_id, "transcript_source": "subs_ytdlp", "transcript_text": text, "diagnostics": diagnostics}
-            if diagnostics["ytdlp_subs_error_code"] == "YTDLP_SUBS_FAILED":
-                diagnostics["elapsed_ms_total"] = int((time.perf_counter() - started) * 1000)
-                return _error(502, "YTDLP_SUBS_FAILED", "yt-dlp subtitles extraction failed", diagnostics)
 
         if not fallback_enabled:
             diagnostics["elapsed_ms_total"] = int((time.perf_counter() - started) * 1000)
