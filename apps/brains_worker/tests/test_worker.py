@@ -45,7 +45,9 @@ def test_transcript_non_200_when_fallback_disabled(monkeypatch):
 
     assert response.status_code == 422
     detail = response.json()["detail"]
-    assert detail["error_code"] == "CAPTIONS_UNAVAILABLE_AND_FALLBACK_DISABLED"
+    assert detail["error_code"] == "NO_CAPTIONS_FALLBACK_DISABLED"
+    assert detail["diagnostics"]["timedtext_list_http_status"] == 200
+    assert detail["diagnostics"]["timedtext_fetch_http_status"] == 0
 
 
 def test_transcript_fallback_attempted_and_openai_missing(monkeypatch):
@@ -76,7 +78,7 @@ def test_transcript_fallback_attempted_and_openai_missing(monkeypatch):
 
     assert response.status_code == 503
     detail = response.json()["detail"]
-    assert detail["error_code"] == "OPENAI_KEY_MISSING"
+    assert detail["error_code"] == "STT_FAILED"
     assert detail["diagnostics"]["audio_fallback_attempted"] is True
 
 
@@ -112,3 +114,56 @@ def test_transcript_fallback_success(monkeypatch):
     assert payload["transcript_source"] == "audio"
     assert payload["transcript_text"] == "hello world"
     assert payload["diagnostics"]["audio_fallback_attempted"] is True
+
+
+def test_transcript_ytdlp_failure_returns_502(monkeypatch):
+    monkeypatch.setenv("BRAINS_API_KEY", "test-key")
+    from apps.brains_worker.main import app, _http_error
+
+    def fake_list_tracks(video_id: str, *, proxy: str | None):
+        return 200, [], None
+
+    def fake_audio(video_id: str, proxy_url: str | None, diagnostics: dict, debug_keep_files: bool):
+        diagnostics["audio_fallback_attempted"] = True
+        diagnostics["audio_download_status"] = "failed"
+        raise _http_error(502, "YTDLP_DOWNLOAD_FAILED", "download failed", diagnostics)
+
+    monkeypatch.setattr("apps.brains_worker.main.timedtext_list_tracks", fake_list_tracks)
+    monkeypatch.setattr("apps.brains_worker.main._audio_fallback", fake_audio)
+
+    client = TestClient(app)
+    response = client.post(
+        "/transcript",
+        headers={"x-api-key": "test-key"},
+        json={"source_id": "yt:5lQf89-AeFo", "allow_audio_fallback": True},
+    )
+
+    assert response.status_code == 502
+    assert response.json()["detail"]["error_code"] == "YTDLP_DOWNLOAD_FAILED"
+
+
+def test_transcript_stt_failure_returns_503(monkeypatch):
+    monkeypatch.setenv("BRAINS_API_KEY", "test-key")
+    from apps.brains_worker.main import app, _http_error
+
+    def fake_list_tracks(video_id: str, *, proxy: str | None):
+        return 200, [], None
+
+    def fake_audio(video_id: str, proxy_url: str | None, diagnostics: dict, debug_keep_files: bool):
+        diagnostics["audio_fallback_attempted"] = True
+        diagnostics["audio_download_status"] = "success"
+        diagnostics["stt_status"] = "failed"
+        raise _http_error(503, "STT_FAILED", "stt failed", diagnostics)
+
+    monkeypatch.setattr("apps.brains_worker.main.timedtext_list_tracks", fake_list_tracks)
+    monkeypatch.setattr("apps.brains_worker.main._audio_fallback", fake_audio)
+
+    client = TestClient(app)
+    response = client.post(
+        "/transcript",
+        headers={"x-api-key": "test-key"},
+        json={"source_id": "yt:5lQf89-AeFo", "allow_audio_fallback": True},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["error_code"] == "STT_FAILED"
