@@ -56,13 +56,13 @@ uvicorn apps.brains_worker.main:app --host 0.0.0.0 --port 8000
 Endpoints:
 
 - `GET /health`
-- `POST /transcript` with `X-Brains-Worker-Key` header.
+- `POST /transcript` with `x-api-key` (or `X-Api-Key`) header.
 
 ## Deployment Notes (DigitalOcean Ubuntu 22.04)
 
 1. Install runtime deps: `python3-venv python3-pip ffmpeg`.
 2. Clone repo to `/opt/brains/brains` and create `.venv`.
-3. `pip install -r requirements.txt` (plus `youtube-transcript-api`/`yt-dlp` if needed).
+3. `pip install -r requirements.txt` and ensure worker deps are in the same runtime venv, e.g. `sudo -u brains /opt/brains-worker/.venv/bin/pip install -U yt-dlp`.
 4. Create `/opt/brains/brains/.env.worker` with Decodo + `BRAINS_WORKER_API_KEY`.
 5. Add systemd service:
    - `ExecStart=/opt/brains/brains/.venv/bin/uvicorn apps.brains_worker.main:app --host 0.0.0.0 --port 8000`

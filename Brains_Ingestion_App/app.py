@@ -177,6 +177,8 @@ with st.expander("Proxy diagnostics", expanded=False):
 
 if "advanced_logs" not in st.session_state:
     st.session_state.advanced_logs = []
+if "request_previews" not in st.session_state:
+    st.session_state.request_previews = []
 
 
 def _log(video_id: str, message: str) -> None:
@@ -185,6 +187,7 @@ def _log(video_id: str, message: str) -> None:
 
 if st.button("Generate Brain Pack", type="primary"):
     st.session_state.advanced_logs = []
+    st.session_state.request_previews = []
     os.environ["DECODO_ENABLED"] = "true" if proxy_enabled else "false"
     os.environ["DECODO_COUNTRY"] = proxy_country.strip()
     os.environ["DECODO_STICKY_MODE"] = "per_video" if proxy_sticky else "off"
@@ -251,6 +254,15 @@ if st.button("Generate Brain Pack", type="primary"):
                 proxy_country=proxy_country.strip() or None,
                 proxy_sticky=proxy_sticky,
             )
+            request_preview = {
+                "source_id": video_key,
+                "preferred_language": "en",
+                "allow_audio_fallback": bool(allow_audio_fallback),
+                "proxy_enabled": bool(proxy_enabled),
+                "proxy_country": proxy_country.strip() or None,
+                "proxy_sticky": bool(proxy_sticky),
+            }
+            st.session_state.request_previews.append(request_preview)
             payload = worker_result.get("json", {})
             status_code = worker_result.get("status_code")
             diagnostics = payload.get("diagnostics", {}) if isinstance(payload, dict) else {}
@@ -439,5 +451,7 @@ if st.button("Generate Brain Pack", type="primary"):
     )
 
     with st.expander("Advanced logs", expanded=False):
+        st.markdown("**Request preview (sanitized)**")
+        st.json(st.session_state.request_previews)
         for entry in st.session_state.advanced_logs:
             st.write(f"[{entry['video']}] {entry['message']}")

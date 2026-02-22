@@ -11,16 +11,9 @@ from urllib.parse import parse_qs, urlparse
 
 import requests
 from fastapi import FastAPI, Header, HTTPException
-from openai import OpenAI
 from pydantic import BaseModel, Field
 from youtube_transcript_api import YouTubeTranscriptApi
-from youtube_transcript_api._errors import (
-    NoTranscriptFound,
-    RequestBlocked,
-    TooManyRequests,
-    TranscriptsDisabled,
-    VideoUnavailable,
-)
+from youtube_transcript_api._errors import NoTranscriptFound
 
 from Brains_Ingestion_App.brains.net.proxy_manager import ProxyManager
 
@@ -56,6 +49,10 @@ def _require_api_key(header_key: str | None) -> None:
         raise HTTPException(status_code=500, detail="BRAINS_API_KEY is not configured")
     if header_key != expected:
         raise HTTPException(status_code=401, detail="Invalid API key")
+
+
+def _tail(value: str | None, limit: int = 2000) -> str:
+    return (value or "")[-limit:]
 
 
 def build_proxy_url(proxy_manager: ProxyManager, proxy_session_key: str | None) -> str | None:
@@ -148,7 +145,7 @@ def _parse_timedtext_segments(body: str) -> list[dict[str, Any]]:
     return segments
 
 
-def timedtext_list_tracks(video_id: str, *, proxy: str | None) -> tuple[int | None, list[dict], str | None]:
+def timedtext_list_tracks(video_id: str, *, proxy: str | None) -> tuple[int | str | None, list[dict], str | None]:
     url = f"https://www.youtube.com/api/timedtext?type=list&v={video_id}"
     proxies = {"http": proxy, "https": proxy} if proxy else None
     last_error = None
@@ -197,7 +194,7 @@ def _pick_best_track(tracks: list[dict], preferred_language: str | None) -> dict
     return sorted(tracks, key=sort_key)[0]
 
 
-def timedtext_fetch_track(video_id: str, track: dict, *, proxy: str | None) -> tuple[int | None, str | None, str | None]:
+def timedtext_fetch_track(video_id: str, track: dict, *, proxy: str | None) -> tuple[int | str | None, str | None, str | None]:
     proxies = {"http": proxy, "https": proxy} if proxy else None
     params = {"v": video_id, "lang": track.get("lang_code") or ""}
     if track.get("kind") == "asr":
@@ -259,12 +256,12 @@ def _fetch_transcript_from_yta(video_id: str, preferred_langs: list[str]) -> tup
     }
 
 
-def ytdlp_download_audio(video_id: str, *, proxy: str | None) -> tuple[str | None, dict[str, Any]]:
+def ytdlp_download_audio(video_id: str, *, proxy: str | None, work_dir: str) -> tuple[str | None, dict[str, Any]]:
     diagnostics: dict[str, Any] = {
-        "ytdlp_exit_code": None,
-        "audio_path": None,
-        "ffmpeg_exit_code": None,
-        "transcribe_method": None,
+        "audio_download_ok": False,
+        "audio_download_exit_code": None,
+        "audio_download_stderr_tail": "",
+        "audio_download_path": None,
     }
     yt_dlp_bin = "/opt/brains-worker/.venv/bin/yt-dlp"
     if not os.path.exists(yt_dlp_bin):
@@ -273,19 +270,15 @@ def ytdlp_download_audio(video_id: str, *, proxy: str | None) -> tuple[str | Non
         diagnostics["error"] = "audio_download_failed"
         return None, diagnostics
 
-    tmp_dir = tempfile.mkdtemp(prefix="brains-audio-")
-    output_template = os.path.join(tmp_dir, f"{video_id}.%(ext)s")
+    output_template = os.path.join(work_dir, "audio.%(ext)s")
     attempts = [None, proxy] if proxy else [None]
     for attempt_proxy in attempts:
         cmd = [
             yt_dlp_bin,
             "--no-playlist",
             "-f",
-            "bestaudio/best",
-            "--extract-audio",
-            "--audio-format",
-            "mp3",
-            "--output",
+            "bestaudio",
+            "-o",
             output_template,
         ]
         if attempt_proxy:
@@ -293,74 +286,140 @@ def ytdlp_download_audio(video_id: str, *, proxy: str | None) -> tuple[str | Non
         cmd.append(f"https://www.youtube.com/watch?v={video_id}")
 
         try:
-            completed = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            completed = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
         except subprocess.TimeoutExpired:
-            diagnostics["ytdlp_exit_code"] = -1
+            diagnostics["audio_download_exit_code"] = -1
+            diagnostics["audio_download_stderr_tail"] = "yt-dlp timeout"
             continue
-        diagnostics["ytdlp_exit_code"] = completed.returncode
+        diagnostics["audio_download_exit_code"] = completed.returncode
+        diagnostics["audio_download_stderr_tail"] = _tail(completed.stderr)
         if completed.returncode != 0:
-            stderr = (completed.stderr or "").lower()
-            if "403" in stderr:
-                continue
             continue
 
-        for name in os.listdir(tmp_dir):
-            if not name.startswith(video_id):
+        for name in os.listdir(work_dir):
+            path = os.path.join(work_dir, name)
+            if not os.path.isfile(path) or name == "audio.wav":
                 continue
-            path = os.path.join(tmp_dir, name)
-            if os.path.getsize(path) < 50 * 1024:
-                diagnostics["error"] = "audio_download_failed"
-                return None, diagnostics
-            diagnostics["audio_path"] = os.path.basename(path)
+            diagnostics["audio_download_ok"] = True
+            diagnostics["audio_download_path"] = path
             return path, diagnostics
 
-    shutil.rmtree(tmp_dir, ignore_errors=True)
     diagnostics["error"] = "audio_download_failed"
     return None, diagnostics
 
 
-def convert_audio_for_transcription(input_path: str) -> tuple[str | None, int | None, str | None]:
-    output_path = f"{os.path.splitext(input_path)[0]}.wav"
-    cmd = ["/usr/bin/ffmpeg", "-y", "-i", input_path, "-ac", "1", "-ar", "16000", output_path]
+def convert_audio_for_transcription(input_path: str, work_dir: str) -> tuple[str | None, int | None, str | None, str]:
+    output_path = os.path.join(work_dir, "audio.wav")
+    ffmpeg_bin = shutil.which("ffmpeg") or "/usr/bin/ffmpeg"
+    cmd = [ffmpeg_bin, "-y", "-i", input_path, "-ac", "1", "-ar", "16000", "-vn", output_path]
     try:
         completed = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
     except subprocess.TimeoutExpired:
-        return None, -1, "audio_convert_failed"
+        return None, -1, "audio_convert_failed", "ffmpeg timeout"
     if completed.returncode != 0:
-        return None, completed.returncode, "audio_convert_failed"
+        return None, completed.returncode, "audio_convert_failed", _tail(completed.stderr)
     if not os.path.exists(output_path) or os.path.getsize(output_path) < 1024:
-        return None, completed.returncode, "audio_convert_failed"
-    return output_path, completed.returncode, None
+        return None, completed.returncode, "audio_convert_failed", "audio.wav missing or too small"
+    return output_path, completed.returncode, None, _tail(completed.stderr)
 
 
-def transcribe_audio(path: str) -> tuple[str | None, list[dict] | None, str | None]:
+def _transcribe_with_openai(path: str, diagnostics: dict[str, Any]) -> tuple[str | None, list[dict] | None, str | None]:
     api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
     if not api_key:
         return None, None, "audio_fallback_missing_api_key"
-
-    client = OpenAI(api_key=api_key)
-    try:
-        with open(path, "rb") as audio_handle:
-            response = client.audio.transcriptions.create(
-                model="gpt-4o-mini-transcribe",
-                file=audio_handle,
-                response_format="verbose_json",
-            )
-    except Exception:
+    model = (os.getenv("BRAINS_TRANSCRIBE_MODEL") or "gpt-4o-mini-transcribe").strip()
+    with open(path, "rb") as audio_handle:
+        response = requests.post(
+            "https://api.openai.com/v1/audio/transcriptions",
+            headers={"Authorization": f"Bearer {api_key}"},
+            files={"file": (os.path.basename(path), audio_handle, "audio/wav")},
+            data={"model": model, "response_format": "verbose_json"},
+            timeout=180,
+        )
+    diagnostics["openai_http_status"] = response.status_code
+    diagnostics["transcription_method"] = "openai"
+    if response.status_code != 200:
+        diagnostics["openai_error"] = _tail(response.text)
         return None, None, "audio_transcribe_failed"
-
+    payload = response.json()
     segments = []
-    for segment in getattr(response, "segments", []) or []:
-        start = float(getattr(segment, "start", 0.0))
-        end = float(getattr(segment, "end", start))
-        text = (getattr(segment, "text", "") or "").strip()
+    for segment in payload.get("segments") or []:
+        start = float(segment.get("start", 0.0) or 0.0)
+        end = float(segment.get("end", start) or start)
+        text = (segment.get("text") or "").strip()
         if text:
             segments.append({"start": start, "duration": max(0.0, end - start), "text": text})
-
-    text = (getattr(response, "text", "") or _full_text(segments)).strip()
+    text = (payload.get("text") or _full_text(segments)).strip()
     if not text:
         return None, None, "audio_transcribe_failed"
     return text, segments, None
+
+
+def _transcribe_with_faster_whisper(path: str, diagnostics: dict[str, Any]) -> tuple[str | None, list[dict] | None, str | None]:
+    try:
+        from faster_whisper import WhisperModel
+    except Exception:
+        return None, None, "audio_fallback_dependency_missing"
+    diagnostics["transcription_method"] = "faster-whisper"
+    model_size = (os.getenv("BRAINS_FASTER_WHISPER_MODEL") or "base").strip()
+    model = WhisperModel(model_size, device="cpu")
+    items, _ = model.transcribe(path)
+    segments: list[dict[str, Any]] = []
+    for item in items:
+        text = (getattr(item, "text", "") or "").strip()
+        if text:
+            start = float(getattr(item, "start", 0.0) or 0.0)
+            end = float(getattr(item, "end", start) or start)
+            segments.append({"start": start, "duration": max(0.0, end - start), "text": text})
+    text = _full_text(segments)
+    if not text:
+        return None, None, "audio_transcribe_failed"
+    return text, segments, None
+
+
+def transcribe_youtube_audio(video_id: str, diagnostics: dict[str, Any], proxy_url: str | None) -> tuple[str | None, list[dict] | None]:
+    base_tmp_dir = "/opt/brains-worker/tmp"
+    os.makedirs(base_tmp_dir, exist_ok=True)
+    work_dir = tempfile.mkdtemp(prefix=f"{video_id}-", dir=base_tmp_dir)
+    keep_tmp = (os.getenv("BRAINS_KEEP_AUDIO_TMP") or "").strip() == "1"
+    diagnostics["audio_fallback"] = {
+        "tmp_dir": work_dir,
+        "audio_download_ok": False,
+        "audio_download_exit_code": None,
+        "audio_download_stderr_tail": "",
+        "audio_download_path": None,
+        "ffmpeg_exit_code": None,
+        "ffmpeg_stderr_tail": "",
+        "transcription_method": None,
+        "openai_http_status": "not_attempted",
+    }
+    try:
+        audio_path, download_diag = ytdlp_download_audio(video_id, proxy=proxy_url, work_dir=work_dir)
+        diagnostics["audio_fallback"].update(download_diag)
+        if not audio_path:
+            diagnostics["error"] = download_diag.get("error") or "audio_download_failed"
+            return None, None
+
+        transcribe_path, ffmpeg_exit_code, convert_error, ffmpeg_stderr_tail = convert_audio_for_transcription(audio_path, work_dir)
+        diagnostics["audio_fallback"]["ffmpeg_exit_code"] = ffmpeg_exit_code
+        diagnostics["audio_fallback"]["ffmpeg_stderr_tail"] = ffmpeg_stderr_tail
+        if convert_error or not transcribe_path:
+            diagnostics["error"] = "audio_convert_failed"
+            return None, None
+
+        if (os.getenv("OPENAI_API_KEY") or "").strip():
+            text, segments, asr_error = _transcribe_with_openai(transcribe_path, diagnostics["audio_fallback"])
+        else:
+            text, segments, asr_error = _transcribe_with_faster_whisper(transcribe_path, diagnostics["audio_fallback"])
+            if asr_error == "audio_fallback_dependency_missing":
+                diagnostics["hint"] = "Set OPENAI_API_KEY on worker OR install faster-whisper"
+        if asr_error or not text:
+            diagnostics["error"] = asr_error or "audio_transcribe_failed"
+            return None, None
+        return text, segments or []
+    finally:
+        if not keep_tmp:
+            shutil.rmtree(work_dir, ignore_errors=True)
 
 
 @app.get("/health")
@@ -386,8 +445,12 @@ def proxy_health(x_api_key: str | None = Header(default=None, alias="X-Api-Key")
 
 
 @app.post("/transcript", response_model=TranscriptResponse)
-def transcript(payload: TranscriptRequest, x_api_key: str | None = Header(default=None, alias="X-Api-Key")) -> TranscriptResponse:
-    _require_api_key(x_api_key)
+def transcript(
+    payload: TranscriptRequest,
+    x_api_key: str | None = Header(default=None, alias="X-Api-Key"),
+    x_api_key_lower: str | None = Header(default=None, alias="x-api-key"),
+) -> TranscriptResponse:
+    _require_api_key(x_api_key or x_api_key_lower)
 
     video_id = extract_video_id(payload.source_id, payload.url)
     if not video_id:
@@ -411,8 +474,8 @@ def transcript(payload: TranscriptRequest, x_api_key: str | None = Header(defaul
         "preferred_language": preferred_language,
         "timedtext_tracks_found": 0,
         "timedtext_best_track": None,
-        "timedtext_list_http_status": None,
-        "timedtext_fetch_http_status": None,
+        "timedtext_list_http_status": "not_attempted",
+        "timedtext_fetch_http_status": "not_attempted",
         "audio_fallback": None,
         "error": None,
     }
@@ -438,39 +501,9 @@ def transcript(payload: TranscriptRequest, x_api_key: str | None = Header(defaul
 
     if not payload.allow_audio_fallback:
         diagnostics["error"] = diagnostics["error"] or "no_caption_tracks"
-        return TranscriptResponse(method="none", text="", segments=[], diagnostics=diagnostics)
+        return TranscriptResponse(method="error", text="", segments=[], diagnostics=diagnostics)
 
-    audio_path, audio_diag = ytdlp_download_audio(video_id, proxy=proxy_url)
-    diagnostics["audio_fallback"] = audio_diag
-    if not audio_path:
-        diagnostics["error"] = audio_diag.get("error") or "audio_download_failed"
-        diagnostics["audio_fallback"]["transcribe_method"] = "not_started"
-        return TranscriptResponse(method="none", text="", segments=[], diagnostics=diagnostics)
-
-    transcribe_path, ffmpeg_exit_code, convert_error = convert_audio_for_transcription(audio_path)
-    diagnostics["audio_fallback"]["ffmpeg_exit_code"] = ffmpeg_exit_code
-    if convert_error or not transcribe_path:
-        diagnostics["error"] = "audio_convert_failed"
-        diagnostics["audio_fallback"]["transcribe_method"] = "not_started"
-        shutil.rmtree(os.path.dirname(audio_path), ignore_errors=True)
-        return TranscriptResponse(method="none", text="", segments=[], diagnostics=diagnostics)
-
-    try:
-        text, segments, asr_error = transcribe_audio(transcribe_path)
-    finally:
-        shutil.rmtree(os.path.dirname(audio_path), ignore_errors=True)
-
-    if asr_error or not text:
-        diagnostics["audio_fallback"]["transcribe_method"] = "whisper"
-        diagnostics["error"] = asr_error or "audio_transcribe_failed"
-        if diagnostics["error"] == "audio_fallback_missing_api_key":
-            return TranscriptResponse(
-                method="audio_fallback_missing_api_key",
-                text="",
-                segments=[],
-                diagnostics=diagnostics,
-            )
-        return TranscriptResponse(method="none", text="", segments=[], diagnostics=diagnostics)
-
-    diagnostics["audio_fallback"]["transcribe_method"] = "whisper"
-    return TranscriptResponse(method="whisper", text=text, segments=segments or [], diagnostics=diagnostics)
+    text, segments = transcribe_youtube_audio(video_id, diagnostics, proxy_url=proxy_url)
+    if not text:
+        return TranscriptResponse(method="error", text="", segments=[], diagnostics=diagnostics)
+    return TranscriptResponse(method="audio", text=text, segments=segments or [], diagnostics=diagnostics)
