@@ -103,7 +103,7 @@ with st.expander("Proxy diagnostics", expanded=False):
             try:
                 response = requests.get(
                     f"{worker_url}/proxy/health",
-                    headers={"X-Api-Key": worker_api_key},
+                    headers={"x-api-key": worker_api_key.strip()},
                     timeout=15,
                 )
                 st.json(response.json())
