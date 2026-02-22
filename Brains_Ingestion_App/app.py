@@ -40,6 +40,11 @@ def _secret_or_env(name: str) -> str:
     return (os.getenv(name) or "").strip()
 
 
+def _worker_headers(worker_api_key: str | None) -> dict:
+    key = (worker_api_key or "").strip()
+    return {"x-api-key": key, "Content-Type": "application/json"}
+
+
 st.set_page_config(page_title="Brains Ingestion", layout="wide")
 st.title("Brains Ingestion")
 
@@ -92,9 +97,12 @@ if worker_url:
     st.info(f"Worker routing enabled: {worker_url}")
 
 with st.expander("Worker diagnostics", expanded=False):
+    safe_key = (worker_api_key or "").strip()
     st.write(f"worker_url present: {bool(worker_url)}")
-    st.write(f"worker_api_key present: {bool(worker_api_key)}")
-    st.write(f"worker_api_key length: {len(worker_api_key)}")
+    st.write(f"worker_api_key present: {bool(safe_key)}")
+    st.write(f"worker_api_key length: {len(worker_api_key or '')}")
+    st.write(f"worker_api_key stripped length: {len(safe_key)}")
+    st.write(f"worker_api_key last4: {safe_key[-4:] if len(safe_key) >= 4 else ''}")
 
 with st.expander("Proxy diagnostics", expanded=False):
     st.json(proxy_manager.safe_diagnostics())
@@ -103,7 +111,7 @@ with st.expander("Proxy diagnostics", expanded=False):
             try:
                 response = requests.get(
                     f"{worker_url}/proxy/health",
-                    headers={"x-api-key": worker_api_key.strip()},
+                    headers=_worker_headers(worker_api_key),
                     timeout=15,
                 )
                 st.json(response.json())
@@ -181,7 +189,7 @@ if st.button("Generate Brain Pack", type="primary"):
                 transcript = get_transcript_from_worker(
                     source,
                     worker_url=worker_url,
-                    worker_api_key=worker_api_key,
+                    worker_api_key=(worker_api_key or "").strip(),
                     allow_audio_fallback=allow_audio_fallback,
                 )
                 _log(video_key, f"Worker transcript method used: {transcript.get('method')}")
