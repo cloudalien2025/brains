@@ -1,4 +1,5 @@
 from pathlib import Path
+import importlib
 import sys
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -7,14 +8,30 @@ if str(REPO_ROOT) not in sys.path:
 
 from fastapi.testclient import TestClient
 
-from apps.brains_worker.main import app
+
+def test_import_smoke_worker_without_openai_key(monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    module = importlib.import_module("apps.brains_worker.main")
+    assert hasattr(module, "app")
 
 
-def test_transcript_no_caption_tracks_includes_http_statuses(monkeypatch):
+def test_transcript_version_endpoint(monkeypatch):
     monkeypatch.setenv("BRAINS_API_KEY", "test-key")
+    from apps.brains_worker.main import app
+
+    client = TestClient(app)
+    response = client.get("/transcript/version")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["service"] == "brains-worker"
+    assert "audio_fallback_supported" in payload
+
+
+def test_transcript_non_200_when_fallback_disabled(monkeypatch):
+    monkeypatch.setenv("BRAINS_API_KEY", "test-key")
+    from apps.brains_worker.main import app
 
     def fake_list_tracks(video_id: str, *, proxy: str | None):
-        assert video_id == "5lQf89-AeFo"
         return 200, [], None
 
     monkeypatch.setattr("apps.brains_worker.main.timedtext_list_tracks", fake_list_tracks)
@@ -26,38 +43,62 @@ def test_transcript_no_caption_tracks_includes_http_statuses(monkeypatch):
         json={"source_id": "yt:5lQf89-AeFo", "allow_audio_fallback": False},
     )
 
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["method"] == "audio_fallback_failed"
-    diagnostics = payload["diagnostics"]
-    assert diagnostics["timedtext_list_http_status"] == 200
-    assert diagnostics["timedtext_fetch_http_status"] is None
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert detail["error_code"] == "CAPTIONS_UNAVAILABLE_AND_FALLBACK_DISABLED"
 
 
-def test_transcript_auth_missing_key_returns_401(monkeypatch):
+def test_transcript_fallback_attempted_and_openai_missing(monkeypatch):
     monkeypatch.setenv("BRAINS_API_KEY", "test-key")
-
-    client = TestClient(app)
-    response = client.post("/transcript", json={"source_id": "yt:5lQf89-AeFo"})
-
-    assert response.status_code == 401
-    assert response.json() == {"detail": "Missing x-api-key"}
-
-
-def test_transcript_captures_audio_fallback_diagnostics(monkeypatch):
-    monkeypatch.setenv("BRAINS_API_KEY", "test-key")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    from apps.brains_worker.main import app
 
     def fake_list_tracks(video_id: str, *, proxy: str | None):
         return 200, [], None
 
-    def fake_audio(video_id: str, diagnostics: dict, proxy_url: str | None):
-        diagnostics["audio_download_ok"] = True
-        diagnostics["audio_file_bytes"] = 130_000
-        diagnostics["transcription_engine"] = "openai"
-        return "hello world", [{"start": 0.0, "duration": 1.0, "text": "hello world"}]
+    def fake_download(video_id: str, proxy: str | None, work_dir: str, diagnostics: dict):
+        sample = Path(work_dir) / "sample.mp3"
+        sample.write_bytes(b"fake-audio")
+        diagnostics["audio_download_status"] = "success"
+        diagnostics["audio_file_bytes"] = sample.stat().st_size
+        diagnostics["audio_download_elapsed_ms"] = 1.0
+        return sample
 
     monkeypatch.setattr("apps.brains_worker.main.timedtext_list_tracks", fake_list_tracks)
-    monkeypatch.setattr("apps.brains_worker.main.transcribe_youtube_audio", fake_audio)
+    monkeypatch.setattr("apps.brains_worker.main._run_ytdlp_download", fake_download)
+
+    client = TestClient(app)
+    response = client.post(
+        "/transcript",
+        headers={"x-api-key": "test-key"},
+        json={"source_id": "yt:5lQf89-AeFo", "allow_audio_fallback": True},
+    )
+
+    assert response.status_code == 503
+    detail = response.json()["detail"]
+    assert detail["error_code"] == "OPENAI_KEY_MISSING"
+    assert detail["diagnostics"]["audio_fallback_attempted"] is True
+
+
+def test_transcript_fallback_success(monkeypatch):
+    monkeypatch.setenv("BRAINS_API_KEY", "test-key")
+    from apps.brains_worker.main import app
+
+    def fake_list_tracks(video_id: str, *, proxy: str | None):
+        return 200, [], None
+
+    def fake_audio(video_id: str, proxy_url: str | None, diagnostics: dict, debug_keep_files: bool):
+        diagnostics["audio_download_status"] = "success"
+        diagnostics["audio_file_bytes"] = 130000
+        diagnostics["audio_download_elapsed_ms"] = 23.0
+        diagnostics["stt_provider"] = "openai"
+        diagnostics["stt_model"] = "gpt-4o-mini-transcribe"
+        diagnostics["stt_status"] = "success"
+        diagnostics["stt_elapsed_ms"] = 111.0
+        return "hello world"
+
+    monkeypatch.setattr("apps.brains_worker.main.timedtext_list_tracks", fake_list_tracks)
+    monkeypatch.setattr("apps.brains_worker.main._audio_fallback", fake_audio)
 
     client = TestClient(app)
     response = client.post(
@@ -68,9 +109,6 @@ def test_transcript_captures_audio_fallback_diagnostics(monkeypatch):
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["method"] == "audio_fallback"
-    assert payload["text"] == "hello world"
-    diagnostics = payload["diagnostics"]
-    assert diagnostics["audio_download_ok"] is True
-    assert diagnostics["audio_file_bytes"] == 130_000
-    assert diagnostics["transcription_engine"] == "openai"
+    assert payload["transcript_source"] == "audio"
+    assert payload["transcript_text"] == "hello world"
+    assert payload["diagnostics"]["audio_fallback_attempted"] is True
