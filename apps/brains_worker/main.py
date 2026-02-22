@@ -22,7 +22,7 @@ import xml.etree.ElementTree as ET
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse
 from openai import OpenAI
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 import requests
 
 from apps.brains_worker.discovery import DiscoveryError, DiscoveryOutcome, discover_youtube_videos
@@ -141,6 +141,9 @@ def write_report(root: Path, run_id: str, run_payload: dict[str, Any]) -> None:
             "diagnostics": f"diagnostics/yt_{vid}.json",
         })
     attempts = load_transcript_attempts(root, run_id)
+    transcript_summary = selected_transcript_summary(attempts)
+    transcript_attempts_selected = transcript_summary["selected_attempts"]
+    caption_probe_attempts = [x for x in attempts if x.get("phase") == "probe"]
     report_payload = {
         "run_id": run_id,
         "brain_id": run_payload.get("brain_id"),
@@ -148,10 +151,18 @@ def write_report(root: Path, run_id: str, run_payload: dict[str, Any]) -> None:
         "discovery_method": (run_payload.get("discovery") or {}).get("method"),
         "youtube_api_http_status": (run_payload.get("discovery") or {}).get("youtube_api_http_status"),
         "candidates_found": int(run_payload.get("candidates_found") or 0),
+        "requested_new": int(run_payload.get("requested_new") or 0),
+        "selected_new": int(run_payload.get("selected_new") or 0),
+        "eligible_shortfall": int(run_payload.get("eligible_shortfall") or 0),
         "ingested_new": len(run_payload.get("ingested_video_ids", [])),
-        "transcripts_succeeded": sum(1 for x in attempts if x.get("result") == "success"),
-        "transcripts_failed": sum(1 for x in attempts if x.get("result") == "fail"),
-        "transcript_failure_reasons": summarize_transcript_failures(attempts),
+        "caption_probe_attempted": len(caption_probe_attempts),
+        "caption_probe_failed": sum(1 for x in caption_probe_attempts if not x.get("success")),
+        "transcripts_attempted_selected": transcript_summary["transcripts_attempted_selected"],
+        "transcripts_succeeded": transcript_summary["transcripts_succeeded"],
+        "transcripts_failed": transcript_summary["transcripts_failed"],
+        "transcripts_failed_selected": transcript_summary["transcripts_failed"],
+        "transcript_failure_reasons": summarize_transcript_failures(transcript_attempts_selected),
+        "sample_failures": sample_failures(transcript_attempts_selected),
         "brain_pack_id": (run_payload.get("brain_pack") or {}).get("brain_pack_id"),
         "transcript_attempts_jsonl": str(run_dir(root, run_id) / "transcript_attempts.jsonl"),
         "artifacts": artifacts,
@@ -197,15 +208,30 @@ def load_transcript_attempts(root: Path, run_id: str) -> list[dict[str, Any]]:
     return rows
 
 
+def selected_transcript_summary(attempts: list[dict[str, Any]]) -> dict[str, Any]:
+    selected_attempts = [x for x in attempts if x.get("phase") in {"transcript", "fallback"} and x.get("selected_for_ingest")]
+    by_video: dict[str, list[dict[str, Any]]] = {}
+    for row in selected_attempts:
+        by_video.setdefault(str(row.get("video_id") or ""), []).append(row)
+    succeeded_videos = {vid for vid, rows in by_video.items() if any(r.get("success") for r in rows)}
+    failed_videos = set(by_video.keys()) - succeeded_videos
+    return {
+        "selected_attempts": selected_attempts,
+        "transcripts_attempted_selected": len(by_video),
+        "transcripts_succeeded": len(succeeded_videos),
+        "transcripts_failed": len(failed_videos),
+    }
+
+
 def summarize_transcript_failures(attempts: list[dict[str, Any]]) -> dict[str, int]:
-    counts = Counter((x.get("error_code") or "unknown") for x in attempts if x.get("result") == "fail")
+    counts = Counter((x.get("error_code") or "unknown") for x in attempts if not x.get("success"))
     return dict(counts.most_common(10))
 
 
 def sample_failures(attempts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     out = []
     for row in attempts:
-        if row.get("result") != "fail":
+        if row.get("success"):
             continue
         out.append({"video_id": row.get("video_id"), "method": row.get("method"), "http_status": row.get("http_status"), "error_code": row.get("error_code"), "error_message": row.get("error_message")})
         if len(out) >= 3:
@@ -213,11 +239,25 @@ def sample_failures(attempts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
-def _build_proxy() -> tuple[bool, str | None, dict[str, str] | None]:
-    proxy_url = (os.getenv("DECODO_PROXY_URL") or os.getenv("RESIDENTIAL_PROXY_URL") or os.getenv("HTTPS_PROXY") or "").strip()
+def _redact_proxy_url(proxy_url: str | None) -> str | None:
     if not proxy_url:
-        return False, None, None
-    return True, "decodo", {"http": proxy_url, "https": proxy_url}
+        return None
+    return re.sub(r"//([^:@/]+):([^@/]+)@", r"//***:***@", proxy_url)
+
+
+def _build_proxy() -> tuple[bool, str | None, str | None, dict[str, str] | None]:
+    proxy_url = (
+        os.getenv("BRAINS_PROXY_URL")
+        or os.getenv("DECODO_PROXY_URL")
+        or os.getenv("RESIDENTIAL_PROXY_URL")
+        or os.getenv("HTTPS_PROXY")
+        or os.getenv("HTTP_PROXY")
+        or ""
+    ).strip()
+    if not proxy_url:
+        return False, None, None, None
+    provider = "decodo" if "decodo" in proxy_url.lower() else "custom"
+    return True, provider, _redact_proxy_url(proxy_url), {"http": proxy_url, "https": proxy_url}
 
 
 def _cookie_source() -> Path | None:
@@ -229,7 +269,7 @@ def _cookie_source() -> Path | None:
 
 def _build_http_session() -> tuple[requests.Session, dict[str, Any]]:
     session = requests.Session()
-    proxy_enabled, provider, proxies = _build_proxy()
+    proxy_enabled, provider, proxy_url_redacted, proxies = _build_proxy()
     if proxies:
         session.proxies.update(proxies)
     source = _cookie_source()
@@ -242,9 +282,28 @@ def _build_http_session() -> tuple[requests.Session, dict[str, Any]]:
             cookies_enabled = True
         except Exception:
             cookies_enabled = False
+    elif source and source.suffix == ".json":
+        try:
+            state = json.loads(source.read_text(encoding="utf-8"))
+            for cookie in state.get("cookies", []):
+                if cookie.get("name") and cookie.get("value"):
+                    session.cookies.set(cookie["name"], cookie["value"], domain=cookie.get("domain"), path=cookie.get("path", "/"))
+            cookies_enabled = bool(state.get("cookies"))
+        except Exception:
+            cookies_enabled = False
+
+    proxy_test_ip = None
+    if proxy_enabled and os.getenv("BRAINS_PROXY_DIAGNOSTICS", "0").lower() in {"1", "true", "yes", "on"}:
+        try:
+            proxy_test_ip = session.get("https://ipinfo.io/ip", timeout=10).text.strip()
+        except Exception:
+            proxy_test_ip = None
+
     return session, {
         "proxy_enabled": proxy_enabled,
         "proxy_provider": provider,
+        "proxy_url_redacted": proxy_url_redacted,
+        "proxy_test_ip": proxy_test_ip,
         "cookies_enabled": cookies_enabled,
         "cookies_source": str(source) if source else None,
     }
@@ -288,7 +347,9 @@ class BrainCreateRequest(BaseModel):
 
 class IngestRequest(BaseModel):
     keyword: str
-    n_new_videos: int = Field(ge=1)
+    n_new_videos: int | None = Field(default=None, ge=1)
+    selected_new: int | None = Field(default=None, ge=1)
+    max_new: int | None = Field(default=None, ge=1)
     max_candidates: int = Field(default=50, ge=1, le=50)
     discovery_order: str | None = Field(default=None, pattern="^(relevance|date)$")
     published_after: str | None = None
@@ -298,6 +359,15 @@ class IngestRequest(BaseModel):
     synthesis: dict[str, bool] = Field(default_factory=lambda: {"update": True})
     brain_pack: dict[str, bool] = Field(default_factory=lambda: {"build": True})
 
+
+    @model_validator(mode="after")
+    def validate_requested_new(self) -> "IngestRequest":
+        requested = self.selected_new or self.max_new or self.n_new_videos
+        if requested is None:
+            raise ValueError("One of selected_new, max_new, or n_new_videos is required")
+        self.n_new_videos = int(requested)
+        self.selected_new = int(requested)
+        return self
 
 def ffprobe_duration(path: Path) -> float | None:
     try:
@@ -519,6 +589,7 @@ async def process_run(job: dict[str, Any]) -> None:
 
     existing_ids = set(ledger.get("ingested_video_ids", []))
     selected_pool = [c for c in candidates if c.get("video_id") and c.get("video_id") not in existing_ids]
+    requested_new = int(payload.selected_new or payload.n_new_videos or 0)
     selected: list[dict[str, Any]] = []
     skipped_duplicates = max(0, len(candidates) - len([c for c in candidates if c.get("video_id") not in existing_ids]))
 
@@ -530,9 +601,11 @@ async def process_run(job: dict[str, Any]) -> None:
     }
     run["candidates_found"] = len(candidates)
     run["candidates"] = candidates[:50]
+    run["requested_new"] = requested_new
     run["selected_new"] = 0
     run["skipped_duplicates"] = skipped_duplicates
     run["progress"] = {"total": len(selected), "done": 0, "failed": 0, "stage": "ingesting"}
+    run["request_contract"] = {"selected_new": requested_new, "payload": payload.model_dump()}
 
     if len(candidates) == 0:
         run["status"] = "completed_with_errors"
@@ -562,15 +635,19 @@ async def process_run(job: dict[str, Any]) -> None:
     session, session_diag = _build_http_session()
     caption_eligible: list[dict[str, Any]] = []
     for src in selected_pool:
-        if len(caption_eligible) >= payload.n_new_videos:
+        if len(caption_eligible) >= requested_new:
             break
         vid = src.get("video_id", "")
         started = time.perf_counter()
         attempt = {
             "run_id": run_id,
+            "brain_slug": brain_id,
             "video_id": vid,
             "video_url": src.get("url"),
+            "title": src.get("title"),
+            "phase": "probe",
             "method": "timedtext_probe",
+            "selected_for_ingest": False,
             **session_diag,
             "http_status": None,
             "error_code": None,
@@ -578,8 +655,8 @@ async def process_run(job: dict[str, Any]) -> None:
             "caption_tracks_found": 0,
             "selected_track": None,
             "elapsed_ms": 0,
-            "result": "fail",
-            "chars": 0,
+            "success": False,
+            "transcript_chars": 0,
         }
         try:
             tracks, status, probe_err = _caption_tracks(session, vid)
@@ -591,7 +668,7 @@ async def process_run(job: dict[str, Any]) -> None:
             elif tracks:
                 track = next((t for t in tracks if (t.get("lang_code") or "").startswith("en")), tracks[0])
                 attempt["selected_track"] = track
-                attempt["result"] = "success"
+                attempt["success"] = True
                 src["selected_track"] = track
                 caption_eligible.append(src)
             else:
@@ -605,12 +682,16 @@ async def process_run(job: dict[str, Any]) -> None:
 
     selected = caption_eligible
     if not selected and AUDIO_FALLBACK_ENABLED:
-        selected = selected_pool[: payload.n_new_videos]
+        selected = selected_pool[: requested_new]
     run["selected_new"] = len(selected)
+    run["eligible_shortfall"] = max(0, requested_new - len(selected))
+    run["caption_probe_attempted"] = len([x for x in load_transcript_attempts(root, run_id) if x.get("phase") == "probe"])
+    run["progress"]["total"] = len(selected)
     write_run(root, run_id, run)
     write_status(root, run_id, run)
 
     for src in selected:
+        src["selected_for_ingest"] = True
         vid = src.get("video_id", "")
         title = src.get("title", "")
         run["current"] = {"video_id": vid, "stage": "ingesting", "detail": title}
@@ -637,9 +718,13 @@ async def process_run(job: dict[str, Any]) -> None:
                     started = time.perf_counter()
                     attempt = {
                         "run_id": run_id,
+                        "brain_slug": brain_id,
                         "video_id": vid,
                         "video_url": src.get("url"),
+                        "title": src.get("title"),
+                        "phase": "transcript",
                         "method": "timedtext",
+                        "selected_for_ingest": True,
                         **session_diag,
                         "http_status": None,
                         "error_code": None,
@@ -647,16 +732,17 @@ async def process_run(job: dict[str, Any]) -> None:
                         "caption_tracks_found": 1,
                         "selected_track": track,
                         "elapsed_ms": 0,
-                        "result": "fail",
-                        "chars": 0,
+                        "success": False,
+                        "transcript_chars": 0,
                     }
                     try:
                         transcript, status = _fetch_timedtext_transcript(session, vid, track)
                         attempt["http_status"] = status
                         if transcript.strip():
-                            attempt["result"] = "success"
-                            attempt["chars"] = len(transcript)
+                            attempt["success"] = True
+                            attempt["transcript_chars"] = len(transcript)
                             transcript_ok = True
+                            attempt["elapsed_ms"] = round((time.perf_counter() - started) * 1000, 2)
                             append_jsonl(transcript_attempts_path, attempt)
                             break
                         attempt["error_code"] = "empty_transcript"
@@ -749,7 +835,24 @@ async def process_run(job: dict[str, Any]) -> None:
     run["errors"] = errors
     run["ingested_video_ids"] = ingested_ids
     run["brain_pack"] = pack_info
-    run["status"] = "completed" if not errors else ("partial_success" if ingested_ids else "failed")
+    attempts = load_transcript_attempts(root, run_id)
+    transcript_summary = selected_transcript_summary(attempts)
+    selected_attempts = transcript_summary["selected_attempts"]
+    transcripts_succeeded = transcript_summary["transcripts_succeeded"]
+    blocked_codes = {"blocked_403", "blocked_429", "caption_probe_http_403", "caption_probe_http_429"}
+    is_blocked = any((x.get("error_code") in blocked_codes) for x in selected_attempts)
+    if transcripts_succeeded >= 1 and errors:
+        run["status"] = "partial_success"
+    elif transcripts_succeeded >= 1:
+        run["status"] = "success"
+    elif run.get("eligible_shortfall", 0) > 0 and run.get("selected_new", 0) == 0:
+        run["status"] = "no_captions"
+        run["message"] = "No caption-eligible videos found in selected candidates"
+    elif is_blocked:
+        run["status"] = "blocked"
+        run["message"] = "Transcript requests were blocked (403/429). Verify proxy and cookie configuration."
+    else:
+        run["status"] = "failed" if errors else "completed"
     run["progress"]["stage"] = "completed"
     run["stage"] = "completed"
     run["current"] = None
@@ -863,14 +966,38 @@ def get_run(run_id: str, x_api_key: str | None = Header(default=None, alias="X-A
         run_payload = load_json(run_matches[0], {})
         root = run_matches[0].parents[2]
         attempts = load_transcript_attempts(root, run_id)
-        payload["transcript_failure_reasons"] = summarize_transcript_failures(attempts)
-        payload["sample_failures"] = sample_failures(attempts)
+        transcript_summary = selected_transcript_summary(attempts)
+        selected_attempts = transcript_summary["selected_attempts"]
+        payload["transcript_failure_reasons"] = summarize_transcript_failures(selected_attempts)
+        payload["sample_failures"] = sample_failures(selected_attempts)
         payload["transcript_attempts_jsonl"] = str(run_dir(root, run_id) / "transcript_attempts.jsonl")
-        payload["transcripts_succeeded"] = sum(1 for x in attempts if x.get("result") == "success")
-        payload["transcripts_failed"] = sum(1 for x in attempts if x.get("result") == "fail")
+        payload["transcripts_attempted_selected"] = transcript_summary["transcripts_attempted_selected"]
+        payload["transcripts_succeeded"] = transcript_summary["transcripts_succeeded"]
+        payload["transcripts_failed"] = transcript_summary["transcripts_failed"]
     elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
     logger.info("get_run_status end run_id=%s elapsed_ms=%s", run_id, elapsed_ms)
     return payload
+
+
+@app.get("/v1/runs/{run_id}/diagnostics")
+def run_diagnostics(run_id: str, x_api_key: str | None = Header(default=None, alias="X-Api-Key")) -> dict[str, Any]:
+    require_api_key(x_api_key)
+    run_matches = list(BRAINS_ROOT.glob(f"*/runs/{run_id}/run.json"))
+    if not run_matches:
+        raise HTTPException(status_code=404, detail="Run not found")
+    run_payload = load_json(run_matches[0], {})
+    root = run_matches[0].parents[2]
+    attempts = load_transcript_attempts(root, run_id)
+    transcript_summary = selected_transcript_summary(attempts)
+    selected_attempts = transcript_summary["selected_attempts"]
+    return {
+        "run_id": run_id,
+        "brain_id": run_payload.get("brain_id"),
+        "transcripts_attempted_selected": transcript_summary["transcripts_attempted_selected"],
+        "transcript_failure_reasons": summarize_transcript_failures(selected_attempts),
+        "sample_failures": sample_failures(selected_attempts),
+        "diagnostics_path": str(run_dir(root, run_id) / "transcript_attempts.jsonl"),
+    }
 
 
 @app.get("/v1/runs/{run_id}/report")
