@@ -9,6 +9,7 @@ from streamlit.errors import StreamlitSecretNotFoundError
 
 
 TERMINAL_RUN_STATES = {"completed", "completed_with_errors", "failed"}
+WORKER_DEFAULT_TIMEOUT = 90
 
 
 def _secret(name: str) -> str:
@@ -61,7 +62,25 @@ worker_api_key = _secret("worker_api_key")
 def worker_request(method: str, path: str, json: dict[str, Any] | None = None, params: dict[str, Any] | None = None) -> requests.Response:
     url = worker_url.rstrip("/") + path
     headers = {"X-Api-Key": worker_api_key}
-    return requests.request(method, url, headers=headers, json=json, params=params, timeout=30)
+    return requests.request(method, url, headers=headers, json=json, params=params, timeout=WORKER_DEFAULT_TIMEOUT)
+
+
+def poll_run_status_with_retry(run_id: str, retries: int = 2) -> tuple[dict[str, Any] | None, str | None]:
+    for attempt in range(retries + 1):
+        try:
+            response = worker_request("GET", f"/v1/runs/{run_id}")
+            if response.ok:
+                return response.json(), None
+            _render_worker_http_error(response)
+            return None, "http_error"
+        except requests.ReadTimeout:
+            if attempt < retries:
+                time.sleep(attempt + 1)
+                continue
+            return None, "timeout"
+        except requests.RequestException as exc:
+            return None, str(exc)
+    return None, "timeout"
 
 
 def normalize_brain(obj: dict[str, Any]) -> dict[str, Any]:
@@ -242,14 +261,11 @@ if run_id:
     polling_enabled = st.checkbox("Polling", value=True)
 
     run_data: dict[str, Any] | None = None
-    try:
-        run_response = worker_request("GET", f"/v1/runs/{run_id}")
-        if run_response.ok:
-            run_data = run_response.json()
-        else:
-            _render_worker_http_error(run_response)
-    except requests.RequestException as exc:
-        st.error(f"Failed to fetch run status: {exc}")
+    run_data, run_error = poll_run_status_with_retry(run_id)
+    if run_error == "timeout":
+        st.warning("Worker reachable but run status timed out; retrying…")
+    elif run_error and run_error != "http_error":
+        st.warning(f"Run status fetch failed temporarily; retrying. Details: {run_error}")
 
     if run_data:
         status = str(run_data.get("status", "unknown"))
@@ -285,6 +301,8 @@ if run_id:
                 report_response = worker_request("GET", f"/v1/runs/{run_id}/report")
                 if report_response.ok:
                     st.session_state["last_report"] = report_response.json()
+                elif report_response.status_code == 202:
+                    st.info("Run finished; report is still being generated.")
                 else:
                     _render_worker_http_error(report_response)
             except requests.RequestException as exc:

@@ -21,7 +21,7 @@ from fastapi.responses import FileResponse
 from openai import OpenAI
 from pydantic import BaseModel, Field
 
-from apps.brains_worker.discovery import DiscoveryError, discover_youtube_videos
+from apps.brains_worker.discovery import DiscoveryError, DiscoveryOutcome, discover_youtube_videos
 
 app = FastAPI(title="Brains Worker v1")
 logger = logging.getLogger(__name__)
@@ -84,6 +84,72 @@ def write_json(path: Path, payload: Any) -> None:
     with tmp.open("w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
     tmp.replace(path)
+
+
+def run_dir(root: Path, run_id: str) -> Path:
+    path = root / "runs" / run_id
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def write_run(root: Path, run_id: str, run_payload: dict[str, Any]) -> None:
+    write_json(run_dir(root, run_id) / "run.json", run_payload)
+
+
+def load_run(root: Path, run_id: str) -> dict[str, Any]:
+    current = run_dir(root, run_id) / "run.json"
+    if current.exists():
+        return load_json(current, {})
+    legacy = root / "runs" / f"{run_id}.json"
+    return load_json(legacy, {})
+
+
+def status_from_run(run_payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "run_id": run_payload.get("run_id"),
+        "brain_slug": run_payload.get("brain_id"),
+        "status": run_payload.get("status", "queued"),
+        "step": run_payload.get("stage", "queued"),
+        "candidates_found": int(run_payload.get("candidates_found") or 0),
+        "selected_new": int(run_payload.get("selected_new") or 0),
+        "completed": int(run_payload.get("completed") or 0),
+        "failed": int(run_payload.get("failed") or 0),
+        "discovery_method": (run_payload.get("discovery") or {}).get("method"),
+        "youtube_api_http_status": (run_payload.get("discovery") or {}).get("youtube_api_http_status"),
+        "updated_at": utc_now(),
+    }
+
+
+def write_status(root: Path, run_id: str, run_payload: dict[str, Any]) -> None:
+    write_json(run_dir(root, run_id) / "status.json", status_from_run(run_payload))
+
+
+def write_report(root: Path, run_id: str, run_payload: dict[str, Any]) -> None:
+    artifacts = []
+    for vid in run_payload.get("ingested_video_ids", []):
+        artifacts.append({
+            "video_id": vid,
+            "source": f"sources/yt_{vid}.json",
+            "transcript": f"transcripts/yt_{vid}.txt",
+            "extraction": f"extractions/yt_{vid}.v1.json",
+            "diagnostics": f"diagnostics/yt_{vid}.json",
+        })
+    report_payload = {
+        "run_id": run_id,
+        "brain_id": run_payload.get("brain_id"),
+        "status": run_payload.get("status"),
+        "discovery_method": (run_payload.get("discovery") or {}).get("method"),
+        "youtube_api_http_status": (run_payload.get("discovery") or {}).get("youtube_api_http_status"),
+        "candidates_found": int(run_payload.get("candidates_found") or 0),
+        "ingested_new": len(run_payload.get("ingested_video_ids", [])),
+        "transcripts_succeeded": len(run_payload.get("ingested_video_ids", [])),
+        "transcripts_failed": len(run_payload.get("errors", [])),
+        "brain_pack_id": (run_payload.get("brain_pack") or {}).get("brain_pack_id"),
+        "artifacts": artifacts,
+        "brain_root": str(root),
+        "updated_at": utc_now(),
+    }
+    write_json(run_dir(root, run_id) / "report.json", report_payload)
 
 
 def read_ledger(root: Path) -> dict[str, Any]:
@@ -295,16 +361,16 @@ async def process_run(job: dict[str, Any]) -> None:
     brain_id = job["brain_id"]
     payload = IngestRequest(**job["payload"])
     root = ensure_dirs(brain_id)
-    run_path = root / "runs" / f"{run_id}.json"
     brain = load_json(root / "brain.json", {})
-    run = load_json(run_path, {})
+    run = load_run(root, run_id)
     run["status"] = "processing"
     run["stage"] = "discovery"
     run["started_at"] = utc_now()
     run["completed"] = 0
     run["failed"] = 0
     run["errors"] = []
-    write_json(run_path, run)
+    write_run(root, run_id, run)
+    write_status(root, run_id, run)
 
     errors: list[str] = []
     ingested_ids: list[str] = []
@@ -316,13 +382,14 @@ async def process_run(job: dict[str, Any]) -> None:
         published_after = "2023-01-01T00:00:00Z"
 
     try:
-        candidates = discover_youtube_videos(
+        discovery_outcome: DiscoveryOutcome = discover_youtube_videos(
             keyword=payload.keyword,
             max_candidates=payload.max_candidates,
             published_after=published_after,
             language=payload.preferred_language,
             order=order,
         )
+        candidates = discovery_outcome.candidates
     except DiscoveryError as exc:
         run["status"] = "completed_with_errors"
         run["final_error_code"] = exc.code
@@ -330,14 +397,21 @@ async def process_run(job: dict[str, Any]) -> None:
         run["errors"] = [exc.message]
         run["stage"] = "completed"
         run["completed_at"] = utc_now()
-        write_json(run_path, run)
+        write_run(root, run_id, run)
+        write_status(root, run_id, run)
+        write_report(root, run_id, run)
         return
 
     existing_ids = set(ledger.get("ingested_video_ids", []))
     selected = [c for c in candidates if c.get("video_id") and c.get("video_id") not in existing_ids][: payload.n_new_videos]
     skipped_duplicates = max(0, len(candidates) - len([c for c in candidates if c.get("video_id") not in existing_ids]))
 
-    run["discovery"] = {"method": "youtube_data_api", "order": order, "published_after": published_after}
+    run["discovery"] = {
+        "method": discovery_outcome.method,
+        "order": order,
+        "published_after": published_after,
+        "youtube_api_http_status": discovery_outcome.youtube_api_http_status,
+    }
     run["candidates_found"] = len(candidates)
     run["candidates"] = candidates[:50]
     run["selected_new"] = len(selected)
@@ -350,7 +424,9 @@ async def process_run(job: dict[str, Any]) -> None:
         run["final_error"] = "YouTube API returned 0 candidates for keyword"
         run["stage"] = "completed"
         run["completed_at"] = utc_now()
-        write_json(run_path, run)
+        write_run(root, run_id, run)
+        write_status(root, run_id, run)
+        write_report(root, run_id, run)
         return
 
     if len(selected) == 0:
@@ -358,16 +434,20 @@ async def process_run(job: dict[str, Any]) -> None:
         run["message"] = "No new videos; all candidates already ingested"
         run["stage"] = "completed"
         run["completed_at"] = utc_now()
-        write_json(run_path, run)
+        write_run(root, run_id, run)
+        write_status(root, run_id, run)
+        write_report(root, run_id, run)
         return
 
-    write_json(run_path, run)
+    write_run(root, run_id, run)
+    write_status(root, run_id, run)
 
     for src in selected:
         vid = src.get("video_id", "")
         title = src.get("title", "")
         run["current"] = {"video_id": vid, "stage": "ingesting", "detail": title}
-        write_json(run_path, run)
+        write_run(root, run_id, run)
+        write_status(root, run_id, run)
         diag: dict[str, Any] = {"video_id": vid, "title": title, "stages": []}
         tmp_dir = root / "tmp" / vid
         tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -389,7 +469,8 @@ async def process_run(job: dict[str, Any]) -> None:
                 async with STT_SEM:
                     run["stage"] = "extracting"
                     run["current"] = {"video_id": vid, "stage": "extracting", "detail": "Transcribing audio"}
-                    write_json(run_path, run)
+                    write_run(root, run_id, run)
+                    write_status(root, run_id, run)
                     transcript, stt_diag = transcribe_audio_chunks(
                         video_id=vid,
                         audio_path=audio_path,
@@ -414,7 +495,8 @@ async def process_run(job: dict[str, Any]) -> None:
             write_json(root / "sources" / f"yt_{vid}.json", source_meta)
             run["stage"] = "synthesizing"
             run["current"] = {"video_id": vid, "stage": "synthesizing", "detail": "Updating synthesis"}
-            write_json(run_path, run)
+            write_run(root, run_id, run)
+            write_status(root, run_id, run)
             extraction = build_extraction(brain.get("brain_type", "BD"), transcript, source_meta)
             write_json(root / "extractions" / f"yt_{vid}.v1.json", extraction)
             async with SYNTH_SEM:
@@ -432,7 +514,8 @@ async def process_run(job: dict[str, Any]) -> None:
         finally:
             run["progress"]["done"] += 1
             run["completed"] = run["progress"]["done"]
-            write_json(run_path, run)
+            write_run(root, run_id, run)
+            write_status(root, run_id, run)
             if not ARCHIVE_AUDIO and tmp_dir.exists():
                 shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -440,7 +523,8 @@ async def process_run(job: dict[str, Any]) -> None:
     if payload.brain_pack.get("build", True):
         run["progress"]["stage"] = "brain_pack"
         run["stage"] = "packing"
-        write_json(run_path, run)
+        write_run(root, run_id, run)
+        write_status(root, run_id, run)
         pack_info = build_brain_pack(root, brain_id, run_id, payload.keyword, ingested_ids, brain.get("brain_type", "BD"))
 
     run["completed_at"] = utc_now()
@@ -453,7 +537,9 @@ async def process_run(job: dict[str, Any]) -> None:
     run["current"] = None
     run["failed"] = run["progress"].get("failed", 0)
     run["completed"] = run["progress"].get("done", 0)
-    write_json(run_path, run)
+    write_run(root, run_id, run)
+    write_status(root, run_id, run)
+    write_report(root, run_id, run)
 
 
 async def queue_worker() -> None:
@@ -535,7 +621,8 @@ async def ingest(brain_id: str, req: IngestRequest, x_api_key: str | None = Head
         "current": None,
         "progress": {"total": 0, "done": 0, "failed": 0, "stage": "queued"},
     }
-    write_json(root / "runs" / f"{run_id}.json", run)
+    write_run(root, run_id, run)
+    write_status(root, run_id, run)
     await RUN_QUEUE.put({"run_id": run_id, "brain_id": brain_id, "payload": req.model_dump()})
     return {"run_id": run_id, "status": "queued"}
 
@@ -543,49 +630,44 @@ async def ingest(brain_id: str, req: IngestRequest, x_api_key: str | None = Head
 @app.get("/v1/runs/{run_id}")
 def get_run(run_id: str, x_api_key: str | None = Header(default=None, alias="X-Api-Key")) -> dict[str, Any]:
     require_api_key(x_api_key)
-    matches = list(BRAINS_ROOT.glob(f"*/runs/{run_id}.json"))
-    if not matches:
-        raise HTTPException(status_code=404, detail="Run not found")
-    return load_json(matches[0], {})
+    started = time.perf_counter()
+    logger.info("get_run_status start run_id=%s", run_id)
+    status_matches = list(BRAINS_ROOT.glob(f"*/runs/{run_id}/status.json"))
+    if status_matches:
+        payload = load_json(status_matches[0], {})
+    else:
+        legacy_matches = list(BRAINS_ROOT.glob(f"*/runs/{run_id}.json"))
+        if not legacy_matches:
+            raise HTTPException(status_code=404, detail="Run not found")
+        payload = status_from_run(load_json(legacy_matches[0], {}))
+    elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
+    logger.info("get_run_status end run_id=%s elapsed_ms=%s", run_id, elapsed_ms)
+    return payload
 
 
 @app.get("/v1/runs/{run_id}/report")
 def run_report(run_id: str, x_api_key: str | None = Header(default=None, alias="X-Api-Key")) -> dict[str, Any]:
     require_api_key(x_api_key)
-    run = get_run(run_id, x_api_key)
-    brain_id = run["brain_id"]
-    root = BRAINS_ROOT / brain_id
-    artifacts = []
-    for vid in run.get("ingested_video_ids", []):
-        artifacts.append({
-            "video_id": vid,
-            "source": f"sources/yt_{vid}.json",
-            "transcript": f"transcripts/yt_{vid}.txt",
-            "extraction": f"extractions/yt_{vid}.v1.json",
-            "diagnostics": f"diagnostics/yt_{vid}.json",
-        })
-    return {
-        "run_id": run_id,
-        "brain_id": brain_id,
-        "status": run.get("status"),
-        "ingested_new": len(run.get("ingested_video_ids", [])),
-        "transcripts_succeeded": len(run.get("ingested_video_ids", [])),
-        "transcripts_failed": len(run.get("errors", [])),
-        "brain_pack_id": (run.get("brain_pack") or {}).get("brain_pack_id"),
-        "artifacts": artifacts,
-        "brain_root": str(root),
-    }
+    matches = list(BRAINS_ROOT.glob(f"*/runs/{run_id}/report.json"))
+    if matches:
+        return load_json(matches[0], {})
+    raise HTTPException(status_code=202, detail="report_not_ready")
 
 
 @app.post("/v1/runs/{run_id}/brain-pack")
 def build_run_pack(run_id: str, x_api_key: str | None = Header(default=None, alias="X-Api-Key")) -> dict[str, Any]:
     require_api_key(x_api_key)
-    run = get_run(run_id, x_api_key)
-    root = BRAINS_ROOT / run["brain_id"]
+    run_matches = list(BRAINS_ROOT.glob(f"*/runs/{run_id}/run.json"))
+    if not run_matches:
+        raise HTTPException(status_code=404, detail="Run not found")
+    run = load_json(run_matches[0], {})
+    root = BRAINS_ROOT / run.get("brain_id")
     brain = load_json(root / "brain.json", {})
     info = build_brain_pack(root, run["brain_id"], run_id, run.get("payload", {}).get("keyword", ""), run.get("ingested_video_ids", []), brain.get("brain_type", "BD"))
     run["brain_pack"] = info
-    write_json(root / "runs" / f"{run_id}.json", run)
+    write_run(root, run_id, run)
+    write_status(root, run_id, run)
+    write_report(root, run_id, run)
     return info
 
 
