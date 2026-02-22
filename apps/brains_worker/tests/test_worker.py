@@ -9,7 +9,7 @@ if str(REPO_ROOT) not in sys.path:
 from fastapi.testclient import TestClient
 
 
-def test_import_smoke_worker_without_openai_key(monkeypatch):
+def test_worker_import_without_openai_key(monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     module = importlib.import_module("apps.brains_worker.main")
     assert hasattr(module, "app")
