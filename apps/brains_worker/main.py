@@ -160,7 +160,7 @@ def timedtext_list_tracks(video_id: str, *, proxy: str | None) -> tuple[int | No
             status_code = response.status_code
             body = (response.text or "").strip()
             if response.status_code != 200:
-                return status_code, [], f"timedtext_list_http_{response.status_code}"
+                return status_code, [], "timedtext_list_failed"
             if "<track" not in body:
                 return status_code, [], None
             root = ET.fromstring(body)
@@ -259,10 +259,19 @@ def _fetch_transcript_from_yta(video_id: str, preferred_langs: list[str]) -> tup
     }
 
 
-def ytdlp_download_audio(video_id: str, *, proxy: str | None) -> tuple[str | None, str | None]:
-    yt_dlp_bin = shutil.which("yt-dlp")
+def ytdlp_download_audio(video_id: str, *, proxy: str | None) -> tuple[str | None, dict[str, Any]]:
+    diagnostics: dict[str, Any] = {
+        "ytdlp_exit_code": None,
+        "audio_path": None,
+        "ffmpeg_exit_code": None,
+        "transcribe_method": None,
+    }
+    yt_dlp_bin = "/opt/brains-worker/.venv/bin/yt-dlp"
+    if not os.path.exists(yt_dlp_bin):
+        yt_dlp_bin = shutil.which("yt-dlp") or ""
     if not yt_dlp_bin:
-        return None, "ytdlp_missing"
+        diagnostics["error"] = "audio_download_failed"
+        return None, diagnostics
 
     tmp_dir = tempfile.mkdtemp(prefix="brains-audio-")
     output_template = os.path.join(tmp_dir, f"{video_id}.%(ext)s")
@@ -284,9 +293,11 @@ def ytdlp_download_audio(video_id: str, *, proxy: str | None) -> tuple[str | Non
         cmd.append(f"https://www.youtube.com/watch?v={video_id}")
 
         try:
-            completed = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
+            completed = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         except subprocess.TimeoutExpired:
+            diagnostics["ytdlp_exit_code"] = -1
             continue
+        diagnostics["ytdlp_exit_code"] = completed.returncode
         if completed.returncode != 0:
             stderr = (completed.stderr or "").lower()
             if "403" in stderr:
@@ -294,21 +305,38 @@ def ytdlp_download_audio(video_id: str, *, proxy: str | None) -> tuple[str | Non
             continue
 
         for name in os.listdir(tmp_dir):
-            if not (name.startswith(video_id) and name.endswith(".mp3")):
+            if not name.startswith(video_id):
                 continue
             path = os.path.join(tmp_dir, name)
             if os.path.getsize(path) < 50 * 1024:
-                return None, "ytdlp_no_file"
-            return path, None
+                diagnostics["error"] = "audio_download_failed"
+                return None, diagnostics
+            diagnostics["audio_path"] = os.path.basename(path)
+            return path, diagnostics
 
     shutil.rmtree(tmp_dir, ignore_errors=True)
-    return None, "ytdlp_failed"
+    diagnostics["error"] = "audio_download_failed"
+    return None, diagnostics
+
+
+def convert_audio_for_transcription(input_path: str) -> tuple[str | None, int | None, str | None]:
+    output_path = f"{os.path.splitext(input_path)[0]}.wav"
+    cmd = ["/usr/bin/ffmpeg", "-y", "-i", input_path, "-ac", "1", "-ar", "16000", output_path]
+    try:
+        completed = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    except subprocess.TimeoutExpired:
+        return None, -1, "audio_convert_failed"
+    if completed.returncode != 0:
+        return None, completed.returncode, "audio_convert_failed"
+    if not os.path.exists(output_path) or os.path.getsize(output_path) < 1024:
+        return None, completed.returncode, "audio_convert_failed"
+    return output_path, completed.returncode, None
 
 
 def transcribe_audio(path: str) -> tuple[str | None, list[dict] | None, str | None]:
     api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
     if not api_key:
-        return None, None, "asr_not_configured"
+        return None, None, "audio_fallback_missing_api_key"
 
     client = OpenAI(api_key=api_key)
     try:
@@ -319,7 +347,7 @@ def transcribe_audio(path: str) -> tuple[str | None, list[dict] | None, str | No
                 response_format="verbose_json",
             )
     except Exception:
-        return None, None, "asr_failed"
+        return None, None, "audio_transcribe_failed"
 
     segments = []
     for segment in getattr(response, "segments", []) or []:
@@ -331,7 +359,7 @@ def transcribe_audio(path: str) -> tuple[str | None, list[dict] | None, str | No
 
     text = (getattr(response, "text", "") or _full_text(segments)).strip()
     if not text:
-        return None, None, "asr_empty"
+        return None, None, "audio_transcribe_failed"
     return text, segments, None
 
 
@@ -385,6 +413,7 @@ def transcript(payload: TranscriptRequest, x_api_key: str | None = Header(defaul
         "timedtext_best_track": None,
         "timedtext_list_http_status": None,
         "timedtext_fetch_http_status": None,
+        "audio_fallback": None,
         "error": None,
     }
 
@@ -411,18 +440,37 @@ def transcript(payload: TranscriptRequest, x_api_key: str | None = Header(defaul
         diagnostics["error"] = diagnostics["error"] or "no_caption_tracks"
         return TranscriptResponse(method="none", text="", segments=[], diagnostics=diagnostics)
 
-    audio_path, dl_error = ytdlp_download_audio(video_id, proxy=proxy_url)
+    audio_path, audio_diag = ytdlp_download_audio(video_id, proxy=proxy_url)
+    diagnostics["audio_fallback"] = audio_diag
     if not audio_path:
-        diagnostics["error"] = dl_error or "ytdlp_failed"
+        diagnostics["error"] = audio_diag.get("error") or "audio_download_failed"
+        diagnostics["audio_fallback"]["transcribe_method"] = "not_started"
+        return TranscriptResponse(method="none", text="", segments=[], diagnostics=diagnostics)
+
+    transcribe_path, ffmpeg_exit_code, convert_error = convert_audio_for_transcription(audio_path)
+    diagnostics["audio_fallback"]["ffmpeg_exit_code"] = ffmpeg_exit_code
+    if convert_error or not transcribe_path:
+        diagnostics["error"] = "audio_convert_failed"
+        diagnostics["audio_fallback"]["transcribe_method"] = "not_started"
+        shutil.rmtree(os.path.dirname(audio_path), ignore_errors=True)
         return TranscriptResponse(method="none", text="", segments=[], diagnostics=diagnostics)
 
     try:
-        text, segments, asr_error = transcribe_audio(audio_path)
+        text, segments, asr_error = transcribe_audio(transcribe_path)
     finally:
         shutil.rmtree(os.path.dirname(audio_path), ignore_errors=True)
 
     if asr_error or not text:
-        diagnostics["error"] = asr_error or "asr_failed"
+        diagnostics["audio_fallback"]["transcribe_method"] = "whisper"
+        diagnostics["error"] = asr_error or "audio_transcribe_failed"
+        if diagnostics["error"] == "audio_fallback_missing_api_key":
+            return TranscriptResponse(
+                method="audio_fallback_missing_api_key",
+                text="",
+                segments=[],
+                diagnostics=diagnostics,
+            )
         return TranscriptResponse(method="none", text="", segments=[], diagnostics=diagnostics)
 
-    return TranscriptResponse(method="asr", text=text, segments=segments or [], diagnostics=diagnostics)
+    diagnostics["audio_fallback"]["transcribe_method"] = "whisper"
+    return TranscriptResponse(method="whisper", text=text, segments=segments or [], diagnostics=diagnostics)
