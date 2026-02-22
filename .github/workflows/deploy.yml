@@ -13,11 +13,14 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Decode SSH key
+        run: |
+          echo "${{ secrets.DROPLET_SSH_KEY_B64 }}" | base64 -d > deploy_key
+          chmod 600 deploy_key
+
       - name: Deploy via SSH
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.DROPLET_HOST }}
-          username: ${{ secrets.DROPLET_USER }}
-          key: ${{ secrets.DROPLET_SSH_KEY }}
-          script: |
-            /opt/brains-worker/deploy.sh
+        run: |
+          ssh -o StrictHostKeyChecking=no \
+              -i deploy_key \
+              ${{ secrets.DROPLET_USER }}@${{ secrets.DROPLET_HOST }} \
+              "/opt/brains-worker/deploy.sh"
