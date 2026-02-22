@@ -21,6 +21,11 @@ VideoUnavailable = getattr(transcript_errors, "VideoUnavailable", Exception)
 TooManyRequests = getattr(transcript_errors, "TooManyRequests", Exception)
 
 
+def _worker_headers(worker_api_key: str | None) -> dict:
+    key = (worker_api_key or "").strip()
+    return {"x-api-key": key, "Content-Type": "application/json"}
+
+
 def _yta_runtime_info() -> dict:
     return {
         "yta_module_file": getattr(yta, "__file__", getattr(yta, "file", None)),
@@ -616,7 +621,7 @@ def get_transcript_from_worker(
 
     response = requests.post(
         f"{base_url}/transcript",
-        headers={"X-Api-Key": worker_api_key, "Content-Type": "application/json"},
+        headers=_worker_headers(worker_api_key),
         json={
             "source_id": f"yt:{_video_id_from_url(source['url'])}",
             "url": source["url"],
