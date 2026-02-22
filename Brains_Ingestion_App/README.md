@@ -55,16 +55,19 @@ uvicorn apps.brains_worker.main:app --host 0.0.0.0 --port 8000
 
 Endpoints:
 
-- `GET /health`
+- `GET /health` returns `{"ok": true, "version": "...", "time": "..."}`.
 - `POST /transcript` with `x-api-key` (or `X-Api-Key`) header.
+  - Missing key returns `401 {"detail": "Missing x-api-key"}`.
+  - Wrong key returns `401 {"detail": "Invalid x-api-key"}`.
+- Worker transcript diagnostics now always include timedtext HTTP statuses and audio fallback telemetry (`audio_download_ok`, `audio_file_bytes`, `transcription_engine`).
 
 ## Deployment Notes (DigitalOcean Ubuntu 22.04)
 
 1. Install runtime deps: `python3-venv python3-pip ffmpeg`.
 2. Clone repo to `/opt/brains/brains` and create `.venv`.
-3. `pip install -r requirements.txt` and ensure worker deps are in the same runtime venv, e.g. `sudo -u brains /opt/brains-worker/.venv/bin/pip install -U yt-dlp`.
+3. `pip install -r requirements.txt` and ensure worker deps are in the same runtime venv, e.g. `sudo -u brains /opt/brains-worker/.venv/bin/pip install -U yt-dlp faster-whisper ctranslate2`.
 4. Create `/opt/brains/brains/.env.worker` with Decodo + `BRAINS_WORKER_API_KEY`.
 5. Add systemd service:
-   - `ExecStart=/opt/brains/brains/.venv/bin/uvicorn apps.brains_worker.main:app --host 0.0.0.0 --port 8000`
+   - `ExecStart=/opt/brains-worker/.venv/bin/uvicorn app:app --host 0.0.0.0 --port 8787 --proxy-headers`
 6. `sudo systemctl daemon-reload && sudo systemctl enable --now brains-worker`.
 7. Put nginx/TLS in front or restrict firewall ingress.

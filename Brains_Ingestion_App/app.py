@@ -74,13 +74,18 @@ def fetch_transcript_via_worker(
     }
     payload = {k: v for k, v in payload.items() if v is not None}
 
+    headers = _worker_headers(worker_api_key)
     response = requests.post(
         f"{worker_url.rstrip('/')}/transcript",
-        headers=_worker_headers(worker_api_key),
+        headers=headers,
         json=payload,
         timeout=timeout,
     )
-    return {"status_code": response.status_code, "json": _safe_json(response)}
+    return {
+        "status_code": response.status_code,
+        "json": _safe_json(response),
+        "header_included": bool((headers.get("x-api-key") or "").strip()),
+    }
 
 
 st.set_page_config(page_title="Brains Ingestion", layout="wide")
@@ -261,6 +266,7 @@ if st.button("Generate Brain Pack", type="primary"):
                 "proxy_enabled": bool(proxy_enabled),
                 "proxy_country": proxy_country.strip() or None,
                 "proxy_sticky": bool(proxy_sticky),
+                "worker_header_included": bool(worker_result.get("header_included")),
             }
             st.session_state.request_previews.append(request_preview)
             payload = worker_result.get("json", {})
@@ -401,6 +407,7 @@ if st.button("Generate Brain Pack", type="primary"):
                 "worker_api_key_present": bool((worker_api_key or "").strip()),
                 "worker_api_key_stripped_length": len((worker_api_key or "").strip()),
                 "worker_api_key_last4": (worker_api_key or "").strip()[-4:] if len((worker_api_key or "").strip()) >= 4 else "",
+                "worker_header_included": bool((worker_api_key or "").strip()),
                 "video_diagnostics": video_diagnostics,
             }
         )

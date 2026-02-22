@@ -3,3 +3,5 @@ uvicorn
 requests
 youtube-transcript-api
 yt-dlp
+faster-whisper
+ctranslate2

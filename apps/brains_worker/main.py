@@ -4,6 +4,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+from datetime import datetime, timezone
 import xml.etree.ElementTree as ET
 from typing import Any
 from urllib.parse import urlencode
@@ -47,8 +48,10 @@ def _require_api_key(header_key: str | None) -> None:
     expected = _read_expected_api_key()
     if not expected:
         raise HTTPException(status_code=500, detail="BRAINS_API_KEY is not configured")
+    if not (header_key or "").strip():
+        raise HTTPException(status_code=401, detail="Missing x-api-key")
     if header_key != expected:
-        raise HTTPException(status_code=401, detail="Invalid API key")
+        raise HTTPException(status_code=401, detail="Invalid x-api-key")
 
 
 def _tail(value: str | None, limit: int = 2000) -> str:
@@ -145,7 +148,7 @@ def _parse_timedtext_segments(body: str) -> list[dict[str, Any]]:
     return segments
 
 
-def timedtext_list_tracks(video_id: str, *, proxy: str | None) -> tuple[int | str | None, list[dict], str | None]:
+def timedtext_list_tracks(video_id: str, *, proxy: str | None) -> tuple[int | None, list[dict], str | None]:
     url = f"https://www.youtube.com/api/timedtext?type=list&v={video_id}"
     proxies = {"http": proxy, "https": proxy} if proxy else None
     last_error = None
@@ -194,7 +197,12 @@ def _pick_best_track(tracks: list[dict], preferred_language: str | None) -> dict
     return sorted(tracks, key=sort_key)[0]
 
 
-def timedtext_fetch_track(video_id: str, track: dict, *, proxy: str | None) -> tuple[int | str | None, str | None, str | None]:
+def timedtext_fetch_track(
+    video_id: str,
+    track: dict,
+    *,
+    proxy: str | None,
+) -> tuple[int | None, str | None, list[dict[str, Any]] | None, str | None]:
     proxies = {"http": proxy, "https": proxy} if proxy else None
     params = {"v": video_id, "lang": track.get("lang_code") or ""}
     if track.get("kind") == "asr":
@@ -219,12 +227,12 @@ def timedtext_fetch_track(video_id: str, track: dict, *, proxy: str | None) -> t
                 segments = _parse_timedtext_segments(body)
                 if not segments:
                     continue
-                return status_code, _full_text(segments), None
+                return status_code, _full_text(segments), segments, None
             except requests.RequestException as exc:
                 last_error = str(exc)[:120]
     if status_code:
-        return status_code, None, f"timedtext_fetch_http_{status_code}"
-    return status_code, None, (last_error or "timedtext_fetch_failed")
+        return status_code, None, None, f"timedtext_fetch_http_{status_code}"
+    return status_code, None, None, (last_error or "timedtext_fetch_failed")
 
 
 def _fetch_transcript_from_yta(video_id: str, preferred_langs: list[str]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -270,16 +278,19 @@ def ytdlp_download_audio(video_id: str, *, proxy: str | None, work_dir: str) -> 
         diagnostics["error"] = "audio_download_failed"
         return None, diagnostics
 
-    output_template = os.path.join(work_dir, "audio.%(ext)s")
+    output_template = os.path.join(work_dir, "%(id)s.%(ext)s")
     attempts = [None, proxy] if proxy else [None]
     for attempt_proxy in attempts:
         cmd = [
             yt_dlp_bin,
             "--no-playlist",
             "-f",
-            "bestaudio",
+            "bestaudio/best",
             "-o",
             output_template,
+            "--restrict-filenames",
+            "--quiet",
+            "--no-warnings",
         ]
         if attempt_proxy:
             cmd.extend(["--proxy", attempt_proxy])
@@ -302,6 +313,7 @@ def ytdlp_download_audio(video_id: str, *, proxy: str | None, work_dir: str) -> 
                 continue
             diagnostics["audio_download_ok"] = True
             diagnostics["audio_download_path"] = path
+            diagnostics["audio_file_bytes"] = os.path.getsize(path)
             return path, diagnostics
 
     diagnostics["error"] = "audio_download_failed"
@@ -382,39 +394,39 @@ def transcribe_youtube_audio(video_id: str, diagnostics: dict[str, Any], proxy_u
     os.makedirs(base_tmp_dir, exist_ok=True)
     work_dir = tempfile.mkdtemp(prefix=f"{video_id}-", dir=base_tmp_dir)
     keep_tmp = (os.getenv("BRAINS_KEEP_AUDIO_TMP") or "").strip() == "1"
-    diagnostics["audio_fallback"] = {
-        "tmp_dir": work_dir,
-        "audio_download_ok": False,
-        "audio_download_exit_code": None,
-        "audio_download_stderr_tail": "",
-        "audio_download_path": None,
-        "ffmpeg_exit_code": None,
-        "ffmpeg_stderr_tail": "",
-        "transcription_method": None,
-        "openai_http_status": "not_attempted",
-    }
     try:
         audio_path, download_diag = ytdlp_download_audio(video_id, proxy=proxy_url, work_dir=work_dir)
-        diagnostics["audio_fallback"].update(download_diag)
+        diagnostics["audio_download_ok"] = bool(download_diag.get("audio_download_ok"))
+        diagnostics["audio_file_bytes"] = download_diag.get("audio_file_bytes")
         if not audio_path:
             diagnostics["error"] = download_diag.get("error") or "audio_download_failed"
+            diagnostics["transcription_engine"] = "none"
+            return None, None
+
+        if (download_diag.get("audio_file_bytes") or 0) < 50 * 1024:
+            diagnostics["error"] = "audio_download_too_small"
+            diagnostics["transcription_engine"] = "none"
             return None, None
 
         transcribe_path, ffmpeg_exit_code, convert_error, ffmpeg_stderr_tail = convert_audio_for_transcription(audio_path, work_dir)
-        diagnostics["audio_fallback"]["ffmpeg_exit_code"] = ffmpeg_exit_code
-        diagnostics["audio_fallback"]["ffmpeg_stderr_tail"] = ffmpeg_stderr_tail
+        diagnostics["ffmpeg_exit_code"] = ffmpeg_exit_code
+        diagnostics["ffmpeg_stderr_tail"] = ffmpeg_stderr_tail
         if convert_error or not transcribe_path:
             diagnostics["error"] = "audio_convert_failed"
+            diagnostics["transcription_engine"] = "none"
             return None, None
 
         if (os.getenv("OPENAI_API_KEY") or "").strip():
-            text, segments, asr_error = _transcribe_with_openai(transcribe_path, diagnostics["audio_fallback"])
+            diagnostics["transcription_engine"] = "openai"
+            text, segments, asr_error = _transcribe_with_openai(transcribe_path, diagnostics)
         else:
-            text, segments, asr_error = _transcribe_with_faster_whisper(transcribe_path, diagnostics["audio_fallback"])
+            diagnostics["transcription_engine"] = "faster_whisper"
+            text, segments, asr_error = _transcribe_with_faster_whisper(transcribe_path, diagnostics)
             if asr_error == "audio_fallback_dependency_missing":
                 diagnostics["hint"] = "Set OPENAI_API_KEY on worker OR install faster-whisper"
         if asr_error or not text:
             diagnostics["error"] = asr_error or "audio_transcribe_failed"
+            diagnostics["transcription_engine"] = "none"
             return None, None
         return text, segments or []
     finally:
@@ -427,6 +439,8 @@ def health() -> dict[str, Any]:
     proxy_manager = ProxyManager()
     return {
         "ok": True,
+        "version": os.getenv("BRAINS_WORKER_VERSION", "dev"),
+        "time": datetime.now(timezone.utc).isoformat(),
         "proxy": proxy_manager.safe_diagnostics(),
     }
 
@@ -472,13 +486,30 @@ def transcript(
         "video_id": video_id,
         "proxy_enabled": bool(proxy_url),
         "preferred_language": preferred_language,
+        "yta_error": None,
         "timedtext_tracks_found": 0,
         "timedtext_best_track": None,
-        "timedtext_list_http_status": "not_attempted",
-        "timedtext_fetch_http_status": "not_attempted",
-        "audio_fallback": None,
+        "timedtext_list_http_status": None,
+        "timedtext_fetch_http_status": None,
+        "audio_download_ok": False,
+        "audio_file_bytes": None,
+        "transcription_engine": "none",
         "error": None,
     }
+
+    try:
+        yta_segments, yta_meta = _fetch_transcript_from_yta(video_id, preferred_langs)
+        yta_text = _full_text(yta_segments)
+        if yta_text:
+            diagnostics["timedtext_tracks_found"] = 0
+            diagnostics["timedtext_best_track"] = {
+                "lang": yta_meta.get("language"),
+                "kind": "asr" if yta_meta.get("is_generated") else "manual",
+                "name": "youtube_transcript_api",
+            }
+            return TranscriptResponse(method="captions", text=yta_text, segments=yta_segments, diagnostics=diagnostics)
+    except Exception as exc:
+        diagnostics["yta_error"] = str(exc)[:300]
 
     list_status, tracks, list_error = timedtext_list_tracks(video_id, proxy=proxy_url)
     diagnostics["timedtext_list_http_status"] = list_status
@@ -493,17 +524,26 @@ def transcript(
             "kind": best_track.get("kind"),
             "name": (best_track.get("name") or "")[:40],
         }
-        fetch_status, transcript_text, fetch_error = timedtext_fetch_track(video_id, best_track, proxy=proxy_url)
+        fetch_status, transcript_text, transcript_segments, fetch_error = timedtext_fetch_track(
+            video_id,
+            best_track,
+            proxy=proxy_url,
+        )
         diagnostics["timedtext_fetch_http_status"] = fetch_status
         if transcript_text:
-            return TranscriptResponse(method="timedtext", text=transcript_text, segments=[], diagnostics=diagnostics)
+            return TranscriptResponse(
+                method="captions",
+                text=transcript_text,
+                segments=transcript_segments or [],
+                diagnostics=diagnostics,
+            )
         diagnostics["error"] = fetch_error or diagnostics["error"] or "timedtext_failed"
 
     if not payload.allow_audio_fallback:
         diagnostics["error"] = diagnostics["error"] or "no_caption_tracks"
-        return TranscriptResponse(method="error", text="", segments=[], diagnostics=diagnostics)
+        return TranscriptResponse(method="audio_fallback_failed", text="", segments=[], diagnostics=diagnostics)
 
     text, segments = transcribe_youtube_audio(video_id, diagnostics, proxy_url=proxy_url)
     if not text:
-        return TranscriptResponse(method="error", text="", segments=[], diagnostics=diagnostics)
-    return TranscriptResponse(method="audio", text=text, segments=segments or [], diagnostics=diagnostics)
+        return TranscriptResponse(method="audio_fallback_failed", text="", segments=[], diagnostics=diagnostics)
+    return TranscriptResponse(method="audio_fallback", text=text, segments=segments or [], diagnostics=diagnostics)
