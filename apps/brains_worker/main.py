@@ -420,8 +420,7 @@ async def startup() -> None:
 
 
 @app.get("/v1/health")
-def health(x_api_key: str | None = Header(default=None, alias="X-Api-Key")) -> dict[str, Any]:
-    require_api_key(x_api_key)
+def health() -> dict[str, Any]:
     return {"status": "ok", "time": utc_now()}
 
 
