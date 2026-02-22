@@ -21,7 +21,7 @@ from fastapi.responses import FileResponse
 from openai import OpenAI
 from pydantic import BaseModel, Field
 
-from Brains_Ingestion_App.adapters.youtube_discovery import discover_videos
+from apps.brains_worker.discovery import DiscoveryError, discover_youtube_videos
 
 app = FastAPI(title="Brains Worker v1")
 logger = logging.getLogger(__name__)
@@ -107,7 +107,10 @@ class BrainCreateRequest(BaseModel):
 
 class IngestRequest(BaseModel):
     keyword: str
-    n_new_videos: int = 5
+    n_new_videos: int = Field(ge=1)
+    max_candidates: int = Field(default=50, ge=1, le=50)
+    discovery_order: str | None = Field(default=None, pattern="^(relevance|date)$")
+    published_after: str | None = None
     mode: str = "audio_first"
     preferred_language: str = "en"
     longform: dict[str, int] = Field(default_factory=lambda: {"chunk_seconds": CHUNK_SECONDS, "overlap_seconds": OVERLAP_SECONDS})
@@ -185,24 +188,10 @@ def transcribe_audio_chunks(video_id: str, audio_path: Path, chunk_seconds: int,
     return stitched, diagnostics
 
 
-def discover_new_videos(keyword: str, n_new_videos: int, existing_ids: set[str]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    candidates = discover_videos(keyword=keyword, max_videos=50)
-
-    def score(item: dict[str, Any]) -> tuple[int, int]:
-        channel = (item.get("channel") or "").lower()
-        authority = 1 if any(k in channel for k in ["official", "media", "news", "podcast"]) else 0
-        recency = 0 if (item.get("published_at") or "") > "2023" else 1
-        return (recency, -authority)
-
-    ranked = sorted(candidates, key=score)
-    selected = []
-    for item in ranked:
-        vid = item.get("source_id", "").replace("yt:", "")
-        if vid and vid not in existing_ids:
-            selected.append(item)
-        if len(selected) >= n_new_videos:
-            break
-    return ranked, selected
+def resolve_discovery_order(brain_type: str, requested_order: str | None) -> str:
+    if requested_order in {"relevance", "date"}:
+        return requested_order
+    return "date" if brain_type == "UAP" else "relevance"
 
 
 def build_extraction(brain_type: str, transcript: str, source_meta: dict[str, Any]) -> dict[str, Any]:
@@ -310,21 +299,75 @@ async def process_run(job: dict[str, Any]) -> None:
     brain = load_json(root / "brain.json", {})
     run = load_json(run_path, {})
     run["status"] = "processing"
+    run["stage"] = "discovery"
     run["started_at"] = utc_now()
+    run["completed"] = 0
+    run["failed"] = 0
+    run["errors"] = []
     write_json(run_path, run)
 
     errors: list[str] = []
     ingested_ids: list[str] = []
     ledger = read_ledger(root)
-    ranked, selected = discover_new_videos(payload.keyword, payload.n_new_videos, set(ledger.get("ingested_video_ids", [])))
-    run["sources_master"] = ranked
-    run["selected_sources"] = selected
-    run["progress"] = {"total": len(selected), "done": 0, "failed": 0, "stage": "transcription"}
+    order = resolve_discovery_order(brain.get("brain_type", "BD"), payload.discovery_order)
+
+    published_after = payload.published_after
+    if not published_after and brain.get("brain_type") == "UAP":
+        published_after = "2023-01-01T00:00:00Z"
+
+    try:
+        candidates = discover_youtube_videos(
+            keyword=payload.keyword,
+            max_candidates=payload.max_candidates,
+            published_after=published_after,
+            language=payload.preferred_language,
+            order=order,
+        )
+    except DiscoveryError as exc:
+        run["status"] = "completed_with_errors"
+        run["final_error_code"] = exc.code
+        run["final_error"] = exc.message
+        run["errors"] = [exc.message]
+        run["stage"] = "completed"
+        run["completed_at"] = utc_now()
+        write_json(run_path, run)
+        return
+
+    existing_ids = set(ledger.get("ingested_video_ids", []))
+    selected = [c for c in candidates if c.get("video_id") and c.get("video_id") not in existing_ids][: payload.n_new_videos]
+    skipped_duplicates = max(0, len(candidates) - len([c for c in candidates if c.get("video_id") not in existing_ids]))
+
+    run["discovery"] = {"method": "youtube_data_api", "order": order, "published_after": published_after}
+    run["candidates_found"] = len(candidates)
+    run["candidates"] = candidates[:50]
+    run["selected_new"] = len(selected)
+    run["skipped_duplicates"] = skipped_duplicates
+    run["progress"] = {"total": len(selected), "done": 0, "failed": 0, "stage": "ingesting"}
+
+    if len(candidates) == 0:
+        run["status"] = "completed_with_errors"
+        run["final_error_code"] = "DISCOVERY_ZERO_RESULTS"
+        run["final_error"] = "YouTube API returned 0 candidates for keyword"
+        run["stage"] = "completed"
+        run["completed_at"] = utc_now()
+        write_json(run_path, run)
+        return
+
+    if len(selected) == 0:
+        run["status"] = "completed"
+        run["message"] = "No new videos; all candidates already ingested"
+        run["stage"] = "completed"
+        run["completed_at"] = utc_now()
+        write_json(run_path, run)
+        return
+
     write_json(run_path, run)
 
     for src in selected:
-        vid = src.get("source_id", "").replace("yt:", "")
+        vid = src.get("video_id", "")
         title = src.get("title", "")
+        run["current"] = {"video_id": vid, "stage": "ingesting", "detail": title}
+        write_json(run_path, run)
         diag: dict[str, Any] = {"video_id": vid, "title": title, "stages": []}
         tmp_dir = root / "tmp" / vid
         tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -344,6 +387,9 @@ async def process_run(job: dict[str, Any]) -> None:
                     audio_path = tmp_dir / f"yt_{vid}.audio.m4a"
                     subprocess.run(["yt-dlp", "-f", "bestaudio/best", "-o", str(audio_path), src.get("url")], check=True, capture_output=True)
                 async with STT_SEM:
+                    run["stage"] = "extracting"
+                    run["current"] = {"video_id": vid, "stage": "extracting", "detail": "Transcribing audio"}
+                    write_json(run_path, run)
                     transcript, stt_diag = transcribe_audio_chunks(
                         video_id=vid,
                         audio_path=audio_path,
@@ -360,12 +406,15 @@ async def process_run(job: dict[str, Any]) -> None:
             source_meta = {
                 "video_id": vid,
                 "title": title,
-                "channel": src.get("channel"),
+                "channel": src.get("channel_title"),
                 "published_at": src.get("published_at"),
                 "url": src.get("url"),
                 "ingested_at": utc_now(),
             }
             write_json(root / "sources" / f"yt_{vid}.json", source_meta)
+            run["stage"] = "synthesizing"
+            run["current"] = {"video_id": vid, "stage": "synthesizing", "detail": "Updating synthesis"}
+            write_json(run_path, run)
             extraction = build_extraction(brain.get("brain_type", "BD"), transcript, source_meta)
             write_json(root / "extractions" / f"yt_{vid}.v1.json", extraction)
             async with SYNTH_SEM:
@@ -377,10 +426,12 @@ async def process_run(job: dict[str, Any]) -> None:
         except Exception as exc:
             errors.append(f"{vid}: {exc}")
             run["progress"]["failed"] += 1
+            run["failed"] = run["progress"]["failed"]
             diag["error"] = str(exc)
             write_json(root / "diagnostics" / f"yt_{vid}.json", diag)
         finally:
             run["progress"]["done"] += 1
+            run["completed"] = run["progress"]["done"]
             write_json(run_path, run)
             if not ARCHIVE_AUDIO and tmp_dir.exists():
                 shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -388,6 +439,7 @@ async def process_run(job: dict[str, Any]) -> None:
     pack_info = None
     if payload.brain_pack.get("build", True):
         run["progress"]["stage"] = "brain_pack"
+        run["stage"] = "packing"
         write_json(run_path, run)
         pack_info = build_brain_pack(root, brain_id, run_id, payload.keyword, ingested_ids, brain.get("brain_type", "BD"))
 
@@ -397,6 +449,10 @@ async def process_run(job: dict[str, Any]) -> None:
     run["brain_pack"] = pack_info
     run["status"] = "completed" if not errors else ("completed_with_errors" if ingested_ids else "failed")
     run["progress"]["stage"] = "completed"
+    run["stage"] = "completed"
+    run["current"] = None
+    run["failed"] = run["progress"].get("failed", 0)
+    run["completed"] = run["progress"].get("done", 0)
     write_json(run_path, run)
 
 
@@ -470,6 +526,13 @@ async def ingest(brain_id: str, req: IngestRequest, x_api_key: str | None = Head
         "status": "queued",
         "created_at": utc_now(),
         "payload": req.model_dump(),
+        "stage": "queued",
+        "candidates_found": 0,
+        "selected_new": 0,
+        "skipped_duplicates": 0,
+        "completed": 0,
+        "failed": 0,
+        "current": None,
         "progress": {"total": 0, "done": 0, "failed": 0, "stage": "queued"},
     }
     write_json(root / "runs" / f"{run_id}.json", run)
@@ -501,7 +564,17 @@ def run_report(run_id: str, x_api_key: str | None = Header(default=None, alias="
             "extraction": f"extractions/yt_{vid}.v1.json",
             "diagnostics": f"diagnostics/yt_{vid}.json",
         })
-    return {"run_id": run_id, "brain_id": brain_id, "status": run.get("status"), "artifacts": artifacts, "brain_root": str(root)}
+    return {
+        "run_id": run_id,
+        "brain_id": brain_id,
+        "status": run.get("status"),
+        "ingested_new": len(run.get("ingested_video_ids", [])),
+        "transcripts_succeeded": len(run.get("ingested_video_ids", [])),
+        "transcripts_failed": len(run.get("errors", [])),
+        "brain_pack_id": (run.get("brain_pack") or {}).get("brain_pack_id"),
+        "artifacts": artifacts,
+        "brain_root": str(root),
+    }
 
 
 @app.post("/v1/runs/{run_id}/brain-pack")

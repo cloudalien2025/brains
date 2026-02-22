@@ -22,6 +22,7 @@ Required env vars:
 
 - `WORKER_API_KEY`
 - `OPENAI_API_KEY`
+- `YOUTUBE_API_KEY`
 
 Optional env vars:
 
@@ -53,3 +54,14 @@ X-Api-Key: <WORKER_API_KEY>
 - `GET /v1/brain-packs/{brain_pack_id}/download`
 
 See `apps/brains_worker/DEPLOYMENT.md` for systemd/nginx notes.
+
+
+## Quick curl checks
+
+```bash
+curl -i https://worker.aiohut.com/v1/health
+curl -i -H "X-Api-Key: <KEY>" https://worker.aiohut.com/v1/brains
+curl -i -H "X-Api-Key: <KEY>" -H "Content-Type: application/json" \
+  -X POST https://worker.aiohut.com/v1/brains/<brain_id>/ingest \
+  -d '{"keyword":"Brilliant Directories","n_new_videos":20,"max_candidates":50,"preferred_language":"en"}'
+```

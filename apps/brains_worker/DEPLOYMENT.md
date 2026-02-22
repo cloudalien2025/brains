@@ -15,6 +15,7 @@ WorkingDirectory=/opt/brains-worker
 Environment=PYTHONUNBUFFERED=1
 Environment=WORKER_API_KEY=<set-me>
 Environment=OPENAI_API_KEY=<set-me>
+Environment=YOUTUBE_API_KEY=<set-me>
 Environment=BRAINS_DATA_DIR=/opt/brains-data
 Environment=MAX_CONCURRENT_DOWNLOADS=3
 Environment=MAX_CONCURRENT_STT=1
