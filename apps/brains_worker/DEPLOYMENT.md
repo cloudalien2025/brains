@@ -20,7 +20,7 @@ Environment=MAX_CONCURRENT_STT=1
 Environment=MAX_CONCURRENT_SYNTHESIS=1
 Environment=CHUNK_SECONDS=600
 Environment=OVERLAP_SECONDS=15
-ExecStart=/opt/brains-worker/.venv/bin/uvicorn apps.brains_worker.main:app --host 0.0.0.0 --port 8081
+ExecStart=/opt/brains-worker/.venv/bin/uvicorn apps.brains_worker.main:app --host 0.0.0.0 --port 8081 --workers 2
 Restart=always
 RestartSec=3
 
