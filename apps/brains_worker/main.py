@@ -117,7 +117,10 @@ def status_from_run(run_payload: dict[str, Any]) -> dict[str, Any]:
         "status": run_payload.get("status", "queued"),
         "step": run_payload.get("stage", "queued"),
         "candidates_found": int(run_payload.get("candidates_found") or 0),
+        "requested_new": int(run_payload.get("requested_new") or 0),
         "selected_new": int(run_payload.get("selected_new") or 0),
+        "eligible_count": int(run_payload.get("eligible_count") or 0),
+        "eligible_shortfall": int(run_payload.get("eligible_shortfall") or 0),
         "completed": int(run_payload.get("completed") or 0),
         "failed": int(run_payload.get("failed") or 0),
         "discovery_method": (run_payload.get("discovery") or {}).get("method"),
@@ -143,7 +146,11 @@ def write_report(root: Path, run_id: str, run_payload: dict[str, Any]) -> None:
     attempts = load_transcript_attempts(root, run_id)
     transcript_summary = selected_transcript_summary(attempts)
     transcript_attempts_selected = transcript_summary["selected_attempts"]
-    caption_probe_attempts = [x for x in attempts if x.get("phase") == "probe"]
+    caption_probe_attempts = [x for x in attempts if x.get("phase") == "caption_probe"]
+    blocked_probe = sum(1 for x in caption_probe_attempts if (x.get("probe_status") or "").startswith("blocked"))
+    no_caption_probe = sum(1 for x in caption_probe_attempts if x.get("probe_status") == "no_captions")
+    audio_attempted = sum(1 for x in attempts if x.get("phase") == "audio_fallback")
+    audio_success = sum(1 for x in attempts if x.get("phase") == "audio_fallback" and x.get("success"))
     report_payload = {
         "run_id": run_id,
         "brain_id": run_payload.get("brain_id"),
@@ -153,16 +160,22 @@ def write_report(root: Path, run_id: str, run_payload: dict[str, Any]) -> None:
         "candidates_found": int(run_payload.get("candidates_found") or 0),
         "requested_new": int(run_payload.get("requested_new") or 0),
         "selected_new": int(run_payload.get("selected_new") or 0),
+        "eligible_count": int(run_payload.get("eligible_count") or 0),
         "eligible_shortfall": int(run_payload.get("eligible_shortfall") or 0),
         "ingested_new": len(run_payload.get("ingested_video_ids", [])),
         "caption_probe_attempted": len(caption_probe_attempts),
-        "caption_probe_failed": sum(1 for x in caption_probe_attempts if not x.get("success")),
+        "caption_probe_blocked": blocked_probe,
+        "caption_probe_no_captions": no_caption_probe,
         "transcripts_attempted_selected": transcript_summary["transcripts_attempted_selected"],
         "transcripts_succeeded": transcript_summary["transcripts_succeeded"],
         "transcripts_failed": transcript_summary["transcripts_failed"],
         "transcripts_failed_selected": transcript_summary["transcripts_failed"],
         "transcript_failure_reasons": summarize_transcript_failures(transcript_attempts_selected),
         "sample_failures": sample_failures(transcript_attempts_selected),
+        "audio_attempted": audio_attempted,
+        "audio_success": audio_success,
+        "total_audio_minutes": run_payload.get("total_audio_minutes"),
+        "audio_fallback_unavailable": run_payload.get("audio_fallback_unavailable", False),
         "brain_pack_id": (run_payload.get("brain_pack") or {}).get("brain_pack_id"),
         "transcript_attempts_jsonl": str(run_dir(root, run_id) / "transcript_attempts.jsonl"),
         "artifacts": artifacts,
@@ -309,10 +322,15 @@ def _build_http_session() -> tuple[requests.Session, dict[str, Any]]:
     }
 
 
-def _caption_tracks(session: requests.Session, video_id: str) -> tuple[list[dict[str, str]], int | None, str | None]:
+def _caption_tracks(session: requests.Session, video_id: str) -> tuple[list[dict[str, str]], int | None, str | None, int]:
     resp = session.get("https://www.youtube.com/api/timedtext", params={"type": "list", "v": video_id}, timeout=20)
+    response_len = len(resp.text or "")
+    if resp.status_code in {403, 429}:
+        return [], resp.status_code, "blocked", response_len
     if resp.status_code != 200:
-        return [], resp.status_code, f"caption_probe_http_{resp.status_code}"
+        return [], resp.status_code, "blocked_error", response_len
+    if not (resp.text or "").strip():
+        return [], resp.status_code, "blocked_empty", response_len
     root = ET.fromstring(resp.text or "<transcript_list/>")
     tracks = []
     for node in root.findall("track"):
@@ -321,7 +339,31 @@ def _caption_tracks(session: requests.Session, video_id: str) -> tuple[list[dict
             "name": node.attrib.get("name", ""),
             "kind": node.attrib.get("kind", ""),
         })
-    return tracks, resp.status_code, None
+    if tracks:
+        return tracks, resp.status_code, "captions_available", response_len
+    return tracks, resp.status_code, "no_captions", response_len
+
+
+def _yt_dlp_exists() -> bool:
+    return shutil.which("yt-dlp") is not None
+
+
+def _download_audio_with_diagnostics(video_url: str, out_path: Path) -> tuple[Path | None, dict[str, Any]]:
+    started = time.perf_counter()
+    cmd = ["yt-dlp", "-f", "bestaudio/best", "-o", str(out_path), video_url]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
+    diag = {
+        "phase": "audio_fallback",
+        "method": "yt-dlp",
+        "command": " ".join(cmd[:4] + ["<url>"]),
+        "exit_code": proc.returncode,
+        "stderr_snippet": (proc.stderr or "")[:500],
+        "elapsed_ms": elapsed_ms,
+        "audio_file_path": str(out_path),
+        "success": proc.returncode == 0 and out_path.exists(),
+    }
+    return (out_path if diag["success"] else None), diag
 
 
 def _fetch_timedtext_transcript(session: requests.Session, video_id: str, track: dict[str, str]) -> tuple[str, int | None]:
@@ -603,6 +645,7 @@ async def process_run(job: dict[str, Any]) -> None:
     run["candidates"] = candidates[:50]
     run["requested_new"] = requested_new
     run["selected_new"] = 0
+    run["eligible_count"] = 0
     run["skipped_duplicates"] = skipped_duplicates
     run["progress"] = {"total": len(selected), "done": 0, "failed": 0, "stage": "ingesting"}
     run["request_contract"] = {"selected_new": requested_new, "payload": payload.model_dump()}
@@ -634,8 +677,15 @@ async def process_run(job: dict[str, Any]) -> None:
 
     session, session_diag = _build_http_session()
     caption_eligible: list[dict[str, Any]] = []
+    blocked_probe_count = 0
+    no_caption_count = 0
+    probe_attempt_count = 0
+    audio_mode = payload.mode == "audio_first"
+    yt_dlp_available = _yt_dlp_exists()
+    run["audio_fallback_unavailable"] = bool(audio_mode and not yt_dlp_available)
+    total_audio_minutes = 0.0
     for src in selected_pool:
-        if len(caption_eligible) >= requested_new:
+        if len(caption_eligible) >= requested_new and not audio_mode:
             break
         vid = src.get("video_id", "")
         started = time.perf_counter()
@@ -645,47 +695,69 @@ async def process_run(job: dict[str, Any]) -> None:
             "video_id": vid,
             "video_url": src.get("url"),
             "title": src.get("title"),
-            "phase": "probe",
+            "phase": "caption_probe",
             "method": "timedtext_probe",
             "selected_for_ingest": False,
             **session_diag,
             "http_status": None,
+            "response_len": 0,
             "error_code": None,
             "error_message": None,
             "caption_tracks_found": 0,
+            "tracks_found": 0,
+            "probe_status": None,
             "selected_track": None,
             "elapsed_ms": 0,
             "success": False,
             "transcript_chars": 0,
         }
         try:
-            tracks, status, probe_err = _caption_tracks(session, vid)
+            tracks, status, probe_status, response_len = _caption_tracks(session, vid)
             attempt["http_status"] = status
+            attempt["response_len"] = response_len
             attempt["caption_tracks_found"] = len(tracks)
-            if probe_err:
-                attempt["error_code"] = probe_err
-                attempt["error_message"] = probe_err
-            elif tracks:
+            attempt["tracks_found"] = len(tracks)
+            attempt["probe_status"] = probe_status
+            if probe_status == "captions_available":
                 track = next((t for t in tracks if (t.get("lang_code") or "").startswith("en")), tracks[0])
                 attempt["selected_track"] = track
                 attempt["success"] = True
                 src["selected_track"] = track
                 caption_eligible.append(src)
-            else:
+            elif probe_status == "no_captions":
                 attempt["error_code"] = "no_captions"
                 attempt["error_message"] = "No caption tracks returned"
+                no_caption_count += 1
+            else:
+                blocked_probe_count += 1
+                attempt["error_code"] = probe_status
+                attempt["error_message"] = probe_status
         except Exception as exc:
-            attempt["error_code"] = "caption_probe_error"
+            blocked_probe_count += 1
+            attempt["probe_status"] = "blocked_error"
+            attempt["error_code"] = "blocked_error"
             attempt["error_message"] = str(exc)
         attempt["elapsed_ms"] = round((time.perf_counter() - started) * 1000, 2)
         append_jsonl(transcript_attempts_path, attempt)
+        probe_attempt_count += 1
 
-    selected = caption_eligible
-    if not selected and AUDIO_FALLBACK_ENABLED:
-        selected = selected_pool[: requested_new]
+    selected = caption_eligible[:requested_new]
+    if audio_mode and len(selected) < requested_new:
+        selected_ids = {x.get("video_id") for x in selected}
+        for src in selected_pool:
+            if src.get("video_id") in selected_ids:
+                continue
+            selected.append(src)
+            selected_ids.add(src.get("video_id"))
+            if len(selected) >= requested_new:
+                break
     run["selected_new"] = len(selected)
+    run["eligible_count"] = len(caption_eligible)
     run["eligible_shortfall"] = max(0, requested_new - len(selected))
-    run["caption_probe_attempted"] = len([x for x in load_transcript_attempts(root, run_id) if x.get("phase") == "probe"])
+    run["caption_probe_attempted"] = probe_attempt_count
+    run["caption_probe_blocked"] = blocked_probe_count
+    run["caption_probe_no_captions"] = no_caption_count
+    run["mode"] = payload.mode
     run["progress"]["total"] = len(selected)
     write_run(root, run_id, run)
     write_status(root, run_id, run)
@@ -764,10 +836,16 @@ async def process_run(job: dict[str, Any]) -> None:
                         continue
                     break
 
-                if not transcript_ok and AUDIO_FALLBACK_ENABLED:
+                if not transcript_ok and audio_mode:
+                    if not yt_dlp_available:
+                        raise RuntimeError("audio_fallback_unavailable: yt-dlp missing")
                     async with DOWNLOAD_SEM:
                         audio_path = tmp_dir / f"yt_{vid}.audio.m4a"
-                        subprocess.run(["yt-dlp", "-f", "bestaudio/best", "-o", str(audio_path), src.get("url")], check=True, capture_output=True)
+                        downloaded, dl_diag = _download_audio_with_diagnostics(src.get("url"), audio_path)
+                        dl_diag.update({"run_id": run_id, "video_id": vid, "selected_for_ingest": True})
+                        append_jsonl(transcript_attempts_path, dl_diag)
+                        if not downloaded:
+                            raise RuntimeError("audio_download_failed")
                     async with STT_SEM:
                         run["stage"] = "extracting"
                         run["current"] = {"video_id": vid, "stage": "extracting", "detail": "Transcribing audio"}
@@ -781,6 +859,18 @@ async def process_run(job: dict[str, Any]) -> None:
                             preferred_language=payload.preferred_language,
                             tmp_dir=tmp_dir,
                         )
+                        audio_seconds = ffprobe_duration(audio_path) or 0
+                        total_audio_minutes += round(audio_seconds / 60.0, 3)
+                        append_jsonl(transcript_attempts_path, {
+                            "run_id": run_id,
+                            "video_id": vid,
+                            "phase": "fallback",
+                            "method": "audio_transcribe",
+                            "selected_for_ingest": True,
+                            "success": bool(transcript.strip()),
+                            "transcript_chars": len(transcript),
+                            "audio_minutes": round(audio_seconds / 60.0, 3),
+                        })
                         diag["stt"] = stt_diag
                 elif not transcript_ok:
                     raise RuntimeError("No transcript available and audio fallback disabled")
@@ -833,24 +923,31 @@ async def process_run(job: dict[str, Any]) -> None:
 
     run["completed_at"] = utc_now()
     run["errors"] = errors
+    run["total_audio_minutes"] = round(total_audio_minutes, 3) if total_audio_minutes > 0 else None
     run["ingested_video_ids"] = ingested_ids
     run["brain_pack"] = pack_info
     attempts = load_transcript_attempts(root, run_id)
     transcript_summary = selected_transcript_summary(attempts)
     selected_attempts = transcript_summary["selected_attempts"]
     transcripts_succeeded = transcript_summary["transcripts_succeeded"]
-    blocked_codes = {"blocked_403", "blocked_429", "caption_probe_http_403", "caption_probe_http_429"}
-    is_blocked = any((x.get("error_code") in blocked_codes) for x in selected_attempts)
+    blocked_codes = {"blocked_403", "blocked_429", "blocked", "blocked_empty", "blocked_error"}
+    probe_attempts = [x for x in attempts if x.get("phase") == "caption_probe"]
+    blocked_probe = sum(1 for x in probe_attempts if x.get("probe_status") in {"blocked", "blocked_empty", "blocked_error"})
+    no_caption_probe = sum(1 for x in probe_attempts if x.get("probe_status") == "no_captions")
+    is_blocked = any((x.get("error_code") in blocked_codes) for x in selected_attempts) or (len(probe_attempts) > 0 and blocked_probe >= max(1, len(probe_attempts) // 2))
     if transcripts_succeeded >= 1 and errors:
         run["status"] = "partial_success"
     elif transcripts_succeeded >= 1:
         run["status"] = "success"
-    elif run.get("eligible_shortfall", 0) > 0 and run.get("selected_new", 0) == 0:
-        run["status"] = "no_captions"
-        run["message"] = "No caption-eligible videos found in selected candidates"
     elif is_blocked:
         run["status"] = "blocked"
-        run["message"] = "Transcript requests were blocked (403/429). Verify proxy and cookie configuration."
+        run["message"] = "Caption/transcript requests appear blocked; check proxy/cookies/network."
+    elif no_caption_probe == len(probe_attempts) and len(probe_attempts) > 0:
+        run["status"] = "no_captions"
+        run["message"] = "No caption-eligible videos found in selected candidates"
+    elif audio_mode and run.get("audio_fallback_unavailable"):
+        run["status"] = "audio_fallback_unimplemented"
+        run["message"] = "audio_first requested but yt-dlp is unavailable"
     else:
         run["status"] = "failed" if errors else "completed"
     run["progress"]["stage"] = "completed"
@@ -935,7 +1032,10 @@ async def ingest(brain_id: str, req: IngestRequest, x_api_key: str | None = Head
         "payload": req.model_dump(),
         "stage": "queued",
         "candidates_found": 0,
+        "requested_new": int(req.selected_new or req.n_new_videos or 0),
         "selected_new": 0,
+        "eligible_count": 0,
+        "eligible_shortfall": 0,
         "skipped_duplicates": 0,
         "completed": 0,
         "failed": 0,
@@ -990,12 +1090,25 @@ def run_diagnostics(run_id: str, x_api_key: str | None = Header(default=None, al
     attempts = load_transcript_attempts(root, run_id)
     transcript_summary = selected_transcript_summary(attempts)
     selected_attempts = transcript_summary["selected_attempts"]
+    probe_attempts = [x for x in attempts if x.get("phase") == "caption_probe"]
+    blocked_probe = sum(1 for x in probe_attempts if (x.get("probe_status") or "").startswith("blocked"))
+    no_caption_probe = sum(1 for x in probe_attempts if x.get("probe_status") == "no_captions")
+    audio_attempts = [x for x in attempts if x.get("phase") == "audio_fallback"]
     return {
         "run_id": run_id,
         "brain_id": run_payload.get("brain_id"),
+        "counts": {
+            "probe_blocked": blocked_probe,
+            "probe_no_captions": no_caption_probe,
+            "transcripts_success": transcript_summary["transcripts_succeeded"],
+            "transcripts_failed": transcript_summary["transcripts_failed"],
+            "audio_attempted": len(audio_attempts),
+            "audio_success": sum(1 for x in audio_attempts if x.get("success")),
+        },
         "transcripts_attempted_selected": transcript_summary["transcripts_attempted_selected"],
         "transcript_failure_reasons": summarize_transcript_failures(selected_attempts),
         "sample_failures": sample_failures(selected_attempts),
+        "sample_entries": attempts[:3],
         "diagnostics_path": str(run_dir(root, run_id) / "transcript_attempts.jsonl"),
     }
 
