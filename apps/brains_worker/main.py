@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+import threading
 import zipfile
 from collections import Counter
 from datetime import datetime, timezone
@@ -56,6 +57,7 @@ CAPTION_PROBE_CACHE_DAYS = int(os.getenv("CAPTION_PROBE_CACHE_DAYS", "14"))
 RUN_QUEUE: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
 RUN_TASK: asyncio.Task | None = None
 RUN_LOCK = asyncio.Lock()
+RUN_INDEX_LOCK = threading.Lock()
 DOWNLOAD_SEM = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 STT_SEM = asyncio.Semaphore(MAX_CONCURRENT_STT)
 SYNTH_SEM = asyncio.Semaphore(MAX_CONCURRENT_SYNTHESIS)
@@ -104,6 +106,31 @@ def run_dir(root: Path, run_id: str) -> Path:
     path = root / "runs" / run_id
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def run_index_path() -> Path:
+    return BRAINS_ROOT / "run_index.json"
+
+
+def register_run(run_id: str, brain_id: str) -> None:
+    with RUN_INDEX_LOCK:
+        index = load_json(run_index_path(), {})
+        index[run_id] = {"brain_id": brain_id, "updated_at": utc_now()}
+        write_json(run_index_path(), index)
+
+
+def resolve_run_root(run_id: str) -> Path | None:
+    index = load_json(run_index_path(), {})
+    brain_id = (index.get(run_id) or {}).get("brain_id")
+    if brain_id:
+        root = BRAINS_ROOT / brain_id
+        if (run_dir(root, run_id) / "run.json").exists():
+            return root
+    # Legacy fallback for historical runs.
+    run_matches = list(BRAINS_ROOT.glob(f"*/runs/{run_id}/run.json"))
+    if run_matches:
+        return run_matches[0].parents[2]
+    return None
 
 
 def write_run(root: Path, run_id: str, run_payload: dict[str, Any]) -> None:
@@ -198,6 +225,95 @@ def write_report(root: Path, run_id: str, run_payload: dict[str, Any]) -> None:
     write_json(run_dir(root, run_id) / "report.json", report_payload)
 
 
+def diagnostics_summary_path(root: Path, run_id: str) -> Path:
+    return run_dir(root, run_id) / "diagnostics_summary.json"
+
+
+def init_diagnostics_summary(root: Path, run_id: str) -> None:
+    write_json(
+        diagnostics_summary_path(root, run_id),
+        {
+            "run_id": run_id,
+            "_selected_video_ids": [],
+            "counts": {
+                "probe_blocked": 0,
+                "probe_no_captions": 0,
+                "transcripts_success": 0,
+                "transcripts_failed": 0,
+                "audio_attempted": 0,
+                "audio_success": 0,
+            },
+            "transcripts_attempted_selected": 0,
+            "transcript_failure_reasons": {},
+            "sample_failures": [],
+            "updated_at": utc_now(),
+        },
+    )
+
+
+def update_diagnostics_summary(transcript_attempts_path: Path, payload: dict[str, Any]) -> None:
+    run_root = transcript_attempts_path.parent
+    summary_path = run_root / "diagnostics_summary.json"
+    summary = load_json(summary_path, None)
+    if not summary:
+        summary = {
+            "run_id": run_root.name,
+            "_selected_video_ids": [],
+            "counts": {
+                "probe_blocked": 0,
+                "probe_no_captions": 0,
+                "transcripts_success": 0,
+                "transcripts_failed": 0,
+                "audio_attempted": 0,
+                "audio_success": 0,
+            },
+            "transcripts_attempted_selected": 0,
+            "transcript_failure_reasons": {},
+            "sample_failures": [],
+        }
+    counts = summary["counts"]
+    phase = payload.get("phase")
+    if phase == "caption_probe":
+        probe_status = payload.get("probe_status")
+        if isinstance(probe_status, str) and probe_status.startswith("blocked"):
+            counts["probe_blocked"] = int(counts.get("probe_blocked", 0)) + 1
+        if probe_status == "no_captions":
+            counts["probe_no_captions"] = int(counts.get("probe_no_captions", 0)) + 1
+    if phase == "audio_fallback":
+        counts["audio_attempted"] = int(counts.get("audio_attempted", 0)) + 1
+        if payload.get("success"):
+            counts["audio_success"] = int(counts.get("audio_success", 0)) + 1
+
+    if phase in {"transcript", "fallback", "transcription"} and payload.get("selected_for_ingest"):
+        attempts_by_video = int(summary.get("transcripts_attempted_selected", 0))
+        seen = set(summary.get("_selected_video_ids") or [])
+        video_id = str(payload.get("video_id") or "")
+        if video_id and video_id not in seen:
+            seen.add(video_id)
+            summary["_selected_video_ids"] = sorted(seen)
+            summary["transcripts_attempted_selected"] = attempts_by_video + 1
+        if payload.get("success"):
+            counts["transcripts_success"] = int(counts.get("transcripts_success", 0)) + 1
+        else:
+            counts["transcripts_failed"] = int(counts.get("transcripts_failed", 0)) + 1
+            reasons = dict(summary.get("transcript_failure_reasons") or {})
+            code = payload.get("error_code") or "unknown"
+            reasons[code] = int(reasons.get(code, 0)) + 1
+            summary["transcript_failure_reasons"] = reasons
+            samples = list(summary.get("sample_failures") or [])
+            if len(samples) < 5:
+                samples.append(
+                    {
+                        "video_id": payload.get("video_id"),
+                        "error_code": payload.get("error_code"),
+                        "error_message": payload.get("error_message"),
+                    }
+                )
+                summary["sample_failures"] = samples
+    summary["updated_at"] = utc_now()
+    write_json(summary_path, summary)
+
+
 def read_ledger(root: Path) -> dict[str, Any]:
     return load_json(root / "ledger.json", {"ingested_video_ids": [], "records": []})
 
@@ -215,6 +331,8 @@ def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    if path.name == "transcript_attempts.jsonl":
+        update_diagnostics_summary(path, payload)
 
 
 def load_transcript_attempts(root: Path, run_id: str) -> list[dict[str, Any]]:
@@ -1206,6 +1324,8 @@ async def ingest(brain_id: str, req: IngestRequest, x_api_key: str | None = Head
     }
     write_run(root, run_id, run)
     write_status(root, run_id, run)
+    init_diagnostics_summary(root, run_id)
+    register_run(run_id, brain_id)
     await RUN_QUEUE.put({"run_id": run_id, "brain_id": brain_id, "payload": req.model_dump()})
     return {"run_id": run_id, "status": "queued"}
 
@@ -1214,28 +1334,24 @@ async def ingest(brain_id: str, req: IngestRequest, x_api_key: str | None = Head
 def get_run(run_id: str, x_api_key: str | None = Header(default=None, alias="X-Api-Key")) -> dict[str, Any]:
     require_api_key(x_api_key)
     started = time.perf_counter()
-    logger.info("get_run_status start run_id=%s", run_id)
-    status_matches = list(BRAINS_ROOT.glob(f"*/runs/{run_id}/status.json"))
-    if status_matches:
-        payload = load_json(status_matches[0], {})
-    else:
+    root = resolve_run_root(run_id)
+    if not root:
         legacy_matches = list(BRAINS_ROOT.glob(f"*/runs/{run_id}.json"))
         if not legacy_matches:
             raise HTTPException(status_code=404, detail="Run not found")
         payload = status_from_run(load_json(legacy_matches[0], {}))
-    run_matches = list(BRAINS_ROOT.glob(f"*/runs/{run_id}/run.json"))
-    if run_matches:
-        run_payload = load_json(run_matches[0], {})
-        root = run_matches[0].parents[2]
-        attempts = load_transcript_attempts(root, run_id)
-        transcript_summary = selected_transcript_summary(attempts)
-        selected_attempts = transcript_summary["selected_attempts"]
-        payload["transcript_failure_reasons"] = summarize_transcript_failures(selected_attempts)
-        payload["sample_failures"] = sample_failures(selected_attempts)
-        payload["transcript_attempts_jsonl"] = str(run_dir(root, run_id) / "transcript_attempts.jsonl")
-        payload["transcripts_attempted_selected"] = transcript_summary["transcripts_attempted_selected"]
-        payload["transcripts_succeeded"] = transcript_summary["transcripts_succeeded"]
-        payload["transcripts_failed"] = transcript_summary["transcripts_failed"]
+        return payload
+
+    status_path = run_dir(root, run_id) / "status.json"
+    payload = load_json(status_path, {})
+    summary = load_json(diagnostics_summary_path(root, run_id), {})
+    payload["transcript_failure_reasons"] = summary.get("transcript_failure_reasons", {})
+    payload["sample_failures"] = summary.get("sample_failures", [])
+    payload["transcript_attempts_jsonl"] = str(run_dir(root, run_id) / "transcript_attempts.jsonl")
+    payload["transcripts_attempted_selected"] = int(summary.get("transcripts_attempted_selected") or 0)
+    counts = summary.get("counts") or {}
+    payload["transcripts_succeeded"] = int(counts.get("transcripts_success") or 0)
+    payload["transcripts_failed"] = int(counts.get("transcripts_failed") or 0)
     elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
     logger.info("get_run_status end run_id=%s elapsed_ms=%s", run_id, elapsed_ms)
     return payload
@@ -1244,43 +1360,31 @@ def get_run(run_id: str, x_api_key: str | None = Header(default=None, alias="X-A
 @app.get("/v1/runs/{run_id}/diagnostics")
 def run_diagnostics(run_id: str, x_api_key: str | None = Header(default=None, alias="X-Api-Key")) -> dict[str, Any]:
     require_api_key(x_api_key)
-    run_matches = list(BRAINS_ROOT.glob(f"*/runs/{run_id}/run.json"))
-    if not run_matches:
+    root = resolve_run_root(run_id)
+    if not root:
         raise HTTPException(status_code=404, detail="Run not found")
-    run_payload = load_json(run_matches[0], {})
-    root = run_matches[0].parents[2]
-    attempts = load_transcript_attempts(root, run_id)
-    transcript_summary = selected_transcript_summary(attempts)
-    selected_attempts = transcript_summary["selected_attempts"]
-    probe_attempts = [x for x in attempts if x.get("phase") == "caption_probe"]
-    blocked_probe = sum(1 for x in probe_attempts if (x.get("probe_status") or "").startswith("blocked"))
-    no_caption_probe = sum(1 for x in probe_attempts if x.get("probe_status") == "no_captions")
-    audio_attempts = [x for x in attempts if x.get("phase") == "audio_fallback"]
-    return {
+    run_payload = load_json(run_dir(root, run_id) / "run.json", {})
+    summary = load_json(diagnostics_summary_path(root, run_id), {})
+    response = {
         "run_id": run_id,
         "brain_id": run_payload.get("brain_id"),
-        "counts": {
-            "probe_blocked": blocked_probe,
-            "probe_no_captions": no_caption_probe,
-            "transcripts_success": transcript_summary["transcripts_succeeded"],
-            "transcripts_failed": transcript_summary["transcripts_failed"],
-            "audio_attempted": len(audio_attempts),
-            "audio_success": sum(1 for x in audio_attempts if x.get("success")),
-        },
-        "transcripts_attempted_selected": transcript_summary["transcripts_attempted_selected"],
-        "transcript_failure_reasons": summarize_transcript_failures(selected_attempts),
-        "sample_failures": sample_failures(selected_attempts),
-        "sample_entries": attempts[:3],
+        "counts": summary.get("counts", {}),
+        "transcripts_attempted_selected": int(summary.get("transcripts_attempted_selected") or 0),
+        "transcript_failure_reasons": summary.get("transcript_failure_reasons", {}),
+        "sample_failures": summary.get("sample_failures", []),
         "diagnostics_path": str(run_dir(root, run_id) / "transcript_attempts.jsonl"),
     }
+    return response
 
 
 @app.get("/v1/runs/{run_id}/report")
 def run_report(run_id: str, x_api_key: str | None = Header(default=None, alias="X-Api-Key")) -> dict[str, Any]:
     require_api_key(x_api_key)
-    matches = list(BRAINS_ROOT.glob(f"*/runs/{run_id}/report.json"))
-    if matches:
-        return load_json(matches[0], {})
+    root = resolve_run_root(run_id)
+    if root:
+        report_path = run_dir(root, run_id) / "report.json"
+        if report_path.exists():
+            return load_json(report_path, {})
     raise HTTPException(status_code=202, detail="report_not_ready")
 
 

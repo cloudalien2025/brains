@@ -77,3 +77,64 @@ def test_health_reports_tooling(monkeypatch):
     body = r.json()
     assert body["yt_dlp_available"] is True
     assert body["ffmpeg_available"] is False
+
+
+def test_get_run_uses_summary_not_jsonl(monkeypatch, tmp_path):
+    main = importlib.import_module("apps.brains_worker.main")
+    monkeypatch.setattr(main, "WORKER_API_KEY", "x")
+    monkeypatch.setattr(main, "BRAINS_ROOT", tmp_path)
+
+    root = tmp_path / "brain-a"
+    run_id = "run_test"
+    main.ensure_dirs("brain-a")
+    main.write_run(root, run_id, {"run_id": run_id, "brain_id": "brain-a", "status": "running", "stage": "ingesting"})
+    main.write_status(root, run_id, {"run_id": run_id, "brain_id": "brain-a", "status": "running", "stage": "ingesting"})
+    main.write_json(
+        main.diagnostics_summary_path(root, run_id),
+        {
+            "counts": {"transcripts_success": 1, "transcripts_failed": 2},
+            "transcripts_attempted_selected": 3,
+            "transcript_failure_reasons": {"blocked": 2},
+            "sample_failures": [{"video_id": "v1", "error_code": "blocked"}],
+        },
+    )
+    main.register_run(run_id, "brain-a")
+
+    monkeypatch.setattr(main, "load_transcript_attempts", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("should not read jsonl")))
+
+    client = TestClient(main.app)
+    res = client.get(f"/v1/runs/{run_id}", headers={"X-Api-Key": "x"})
+    assert res.status_code == 200
+    body = res.json()
+    assert body["transcripts_succeeded"] == 1
+    assert body["transcripts_failed"] == 2
+    assert body["transcript_failure_reasons"]["blocked"] == 2
+
+
+def test_run_diagnostics_reads_summary(monkeypatch, tmp_path):
+    main = importlib.import_module("apps.brains_worker.main")
+    monkeypatch.setattr(main, "WORKER_API_KEY", "x")
+    monkeypatch.setattr(main, "BRAINS_ROOT", tmp_path)
+
+    root = tmp_path / "brain-b"
+    run_id = "run_diag"
+    main.ensure_dirs("brain-b")
+    main.write_run(root, run_id, {"run_id": run_id, "brain_id": "brain-b", "status": "running"})
+    main.write_json(
+        main.diagnostics_summary_path(root, run_id),
+        {
+            "counts": {"probe_blocked": 4, "probe_no_captions": 1, "audio_attempted": 2, "audio_success": 1},
+            "transcripts_attempted_selected": 5,
+            "transcript_failure_reasons": {"no_captions": 2},
+            "sample_failures": [{"video_id": "v2", "error_code": "no_captions"}],
+        },
+    )
+    main.register_run(run_id, "brain-b")
+
+    client = TestClient(main.app)
+    res = client.get(f"/v1/runs/{run_id}/diagnostics", headers={"X-Api-Key": "x"})
+    assert res.status_code == 200
+    body = res.json()
+    assert body["counts"]["probe_blocked"] == 4
+    assert body["transcripts_attempted_selected"] == 5
+    assert body["transcript_failure_reasons"]["no_captions"] == 2
