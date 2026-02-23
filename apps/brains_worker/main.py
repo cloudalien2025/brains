@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import random
 import html
 import csv
 import http.cookiejar
@@ -43,6 +44,12 @@ OVERLAP_SECONDS = int(os.getenv("OVERLAP_SECONDS", "15"))
 ARCHIVE_AUDIO = (os.getenv("ARCHIVE_AUDIO", "false").lower() in {"1", "true", "yes", "on"})
 AUDIO_FALLBACK_ENABLED = os.getenv("AUDIO_FALLBACK_ENABLED", "0").lower() in {"1", "true", "yes", "on"}
 COOKIES_PATHS = [Path("/workspace/brains/cookies/youtube_cookies.txt"), Path("/workspace/brains/cookies/youtube_storage_state.json")]
+CAPTION_PROBE_CONCURRENCY = max(1, int(os.getenv("CAPTION_PROBE_CONCURRENCY", "2")))
+CAPTION_PROBE_DELAY_MIN_MS = int(os.getenv("CAPTION_PROBE_DELAY_MIN_MS", "350"))
+CAPTION_PROBE_DELAY_MAX_MS = int(os.getenv("CAPTION_PROBE_DELAY_MAX_MS", "800"))
+CAPTION_PROBE_429_COOLDOWN_AFTER = int(os.getenv("CAPTION_PROBE_429_COOLDOWN_AFTER", "5"))
+CAPTION_PROBE_429_COOLDOWN_SECONDS = int(os.getenv("CAPTION_PROBE_429_COOLDOWN_SECONDS", "45"))
+CAPTION_PROBE_CACHE_DAYS = int(os.getenv("CAPTION_PROBE_CACHE_DAYS", "14"))
 
 
 
@@ -52,6 +59,7 @@ RUN_LOCK = asyncio.Lock()
 DOWNLOAD_SEM = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 STT_SEM = asyncio.Semaphore(MAX_CONCURRENT_STT)
 SYNTH_SEM = asyncio.Semaphore(MAX_CONCURRENT_SYNTHESIS)
+CAPTION_PROBE_SEM = asyncio.Semaphore(CAPTION_PROBE_CONCURRENCY)
 
 
 def utc_now() -> str:
@@ -151,6 +159,8 @@ def write_report(root: Path, run_id: str, run_payload: dict[str, Any]) -> None:
     no_caption_probe = sum(1 for x in caption_probe_attempts if x.get("probe_status") == "no_captions")
     audio_attempted = sum(1 for x in attempts if x.get("phase") == "audio_fallback")
     audio_success = sum(1 for x in attempts if x.get("phase") == "audio_fallback" and x.get("success"))
+    audio_failures = [x for x in attempts if x.get("phase") == "audio_fallback" and not x.get("success")]
+    audio_failure_reasons = dict(Counter((x.get("error_code") or "audio_download_failed") for x in audio_failures).most_common(10))
     report_payload = {
         "run_id": run_id,
         "brain_id": run_payload.get("brain_id"),
@@ -176,6 +186,9 @@ def write_report(root: Path, run_id: str, run_payload: dict[str, Any]) -> None:
         "audio_success": audio_success,
         "total_audio_minutes": run_payload.get("total_audio_minutes"),
         "audio_fallback_unavailable": run_payload.get("audio_fallback_unavailable", False),
+        "audio_failure_reasons": audio_failure_reasons,
+        "sample_audio_failures": [{"video_id": x.get("video_id"), "error_code": x.get("error_code"), "stderr_tail": x.get("stderr_tail")} for x in audio_failures[:3]],
+        "proxy_enabled": any(bool(x.get("proxy_enabled")) for x in attempts),
         "brain_pack_id": (run_payload.get("brain_pack") or {}).get("brain_pack_id"),
         "transcript_attempts_jsonl": str(run_dir(root, run_id) / "transcript_attempts.jsonl"),
         "artifacts": artifacts,
@@ -259,6 +272,7 @@ def _redact_proxy_url(proxy_url: str | None) -> str | None:
 
 
 def _build_proxy() -> tuple[bool, str | None, str | None, dict[str, str] | None]:
+    proxy_enabled_env = os.getenv("BRAINS_PROXY_ENABLED", "0").lower() in {"1", "true", "yes", "on"}
     proxy_url = (
         os.getenv("BRAINS_PROXY_URL")
         or os.getenv("DECODO_PROXY_URL")
@@ -268,6 +282,8 @@ def _build_proxy() -> tuple[bool, str | None, str | None, dict[str, str] | None]
         or ""
     ).strip()
     if not proxy_url:
+        return False, None, None, None
+    if not proxy_enabled_env and os.getenv("BRAINS_PROXY_ENABLED") is not None:
         return False, None, None, None
     provider = "decodo" if "decodo" in proxy_url.lower() else "custom"
     return True, provider, _redact_proxy_url(proxy_url), {"http": proxy_url, "https": proxy_url}
@@ -322,15 +338,68 @@ def _build_http_session() -> tuple[requests.Session, dict[str, Any]]:
     }
 
 
-def _caption_tracks(session: requests.Session, video_id: str) -> tuple[list[dict[str, str]], int | None, str | None, int]:
-    resp = session.get("https://www.youtube.com/api/timedtext", params={"type": "list", "v": video_id}, timeout=20)
+def _caption_cache_path(root: Path, video_id: str) -> Path:
+    return root / "cache" / "caption_probe" / f"{video_id}.json"
+
+
+def _load_caption_probe_cache(root: Path, video_id: str) -> dict[str, Any] | None:
+    path = _caption_cache_path(root, video_id)
+    if not path.exists():
+        return None
+    try:
+        cached = load_json(path, {})
+        probed_at = datetime.fromisoformat(cached.get("probed_at", "").replace("Z", "+00:00"))
+        age = datetime.now(timezone.utc) - probed_at
+        if age.days <= CAPTION_PROBE_CACHE_DAYS:
+            return cached
+    except Exception:
+        return None
+    return None
+
+
+def _save_caption_probe_cache(root: Path, video_id: str, payload: dict[str, Any]) -> None:
+    write_json(_caption_cache_path(root, video_id), payload)
+
+
+def _proxy_url_raw() -> str | None:
+    return (
+        os.getenv("BRAINS_PROXY_URL")
+        or os.getenv("DECODO_PROXY_URL")
+        or os.getenv("RESIDENTIAL_PROXY_URL")
+        or os.getenv("HTTPS_PROXY")
+        or os.getenv("HTTP_PROXY")
+        or None
+    )
+
+
+def _request_with_backoff(session: requests.Session, url: str, params: dict[str, Any], timeout: int = 20) -> tuple[requests.Response | None, dict[str, Any]]:
+    retries: list[dict[str, Any]] = []
+    for attempt in range(5):
+        try:
+            resp = session.get(url, params=params, timeout=timeout)
+            if resp.status_code != 429:
+                return resp, {"retry_count": attempt, "retries": retries}
+            sleep_s = min(8, 2 ** attempt) + random.uniform(0.1, 0.9)
+            retries.append({"attempt": attempt + 1, "http_status": 429, "sleep_seconds": round(sleep_s, 2)})
+            time.sleep(sleep_s)
+        except requests.RequestException as exc:
+            sleep_s = min(8, 2 ** attempt) + random.uniform(0.1, 0.9)
+            retries.append({"attempt": attempt + 1, "error": str(exc), "sleep_seconds": round(sleep_s, 2)})
+            time.sleep(sleep_s)
+    return None, {"retry_count": len(retries), "retries": retries, "error": "retries_exhausted"}
+
+
+def _caption_tracks(session: requests.Session, video_id: str) -> tuple[list[dict[str, str]], int | None, str | None, int, dict[str, Any]]:
+    resp, retry_diag = _request_with_backoff(session, "https://www.youtube.com/api/timedtext", {"type": "list", "v": video_id}, timeout=20)
+    if resp is None:
+        return [], None, "blocked_error", 0, retry_diag
     response_len = len(resp.text or "")
     if resp.status_code in {403, 429}:
-        return [], resp.status_code, "blocked", response_len
+        return [], resp.status_code, "blocked", response_len, retry_diag
     if resp.status_code != 200:
-        return [], resp.status_code, "blocked_error", response_len
+        return [], resp.status_code, "blocked_error", response_len, retry_diag
     if not (resp.text or "").strip():
-        return [], resp.status_code, "blocked_empty", response_len
+        return [], resp.status_code, "blocked_empty", response_len, retry_diag
     root = ET.fromstring(resp.text or "<transcript_list/>")
     tracks = []
     for node in root.findall("track"):
@@ -340,45 +409,66 @@ def _caption_tracks(session: requests.Session, video_id: str) -> tuple[list[dict
             "kind": node.attrib.get("kind", ""),
         })
     if tracks:
-        return tracks, resp.status_code, "captions_available", response_len
-    return tracks, resp.status_code, "no_captions", response_len
+        return tracks, resp.status_code, "captions_available", response_len, retry_diag
+    return tracks, resp.status_code, "no_captions", response_len, retry_diag
 
 
 def _yt_dlp_exists() -> bool:
     return shutil.which("yt-dlp") is not None
 
 
+def _ffmpeg_exists() -> bool:
+    return shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None
+
+
 def _download_audio_with_diagnostics(video_url: str, out_path: Path) -> tuple[Path | None, dict[str, Any]]:
     started = time.perf_counter()
-    cmd = ["yt-dlp", "-f", "bestaudio/best", "-o", str(out_path), video_url]
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "yt-dlp", "-f", "bestaudio/best", "--extract-audio", "--audio-format", "mp3", "--no-playlist", "-o", str(out_path), video_url,
+    ]
+    proxy_url = _proxy_url_raw()
+    if proxy_url:
+        cmd.extend(["--proxy", proxy_url])
+    cookie_source = _cookie_source()
+    if cookie_source and cookie_source.suffix == ".txt":
+        cmd.extend(["--cookies", str(cookie_source)])
     proc = subprocess.run(cmd, capture_output=True, text=True)
     elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
+    matched = sorted(out_path.parent.glob(f"{out_path.stem.split('.')[0]}*"))
+    resolved = matched[0] if matched else out_path
+    stderr_tail = (proc.stderr or "")[-1000:]
+    stderr_tail = re.sub(r"//([^:@/]+):([^@/]+)@", "//***:***@", stderr_tail)
     diag = {
         "phase": "audio_fallback",
         "method": "yt-dlp",
-        "command": " ".join(cmd[:4] + ["<url>"]),
+        "command": "yt-dlp -f bestaudio/best --extract-audio --audio-format mp3 --no-playlist -o <output> <url>",
         "exit_code": proc.returncode,
-        "stderr_snippet": (proc.stderr or "")[:500],
+        "stderr_tail": stderr_tail,
         "elapsed_ms": elapsed_ms,
-        "audio_file_path": str(out_path),
-        "success": proc.returncode == 0 and out_path.exists(),
+        "audio_file_path": str(resolved),
+        "bytes": resolved.stat().st_size if resolved.exists() else 0,
+        "proxy_enabled": bool(proxy_url),
+        "success": proc.returncode == 0 and resolved.exists(),
     }
-    return (out_path if diag["success"] else None), diag
+    return (resolved if diag["success"] else None), diag
 
 
-def _fetch_timedtext_transcript(session: requests.Session, video_id: str, track: dict[str, str]) -> tuple[str, int | None]:
+def _fetch_timedtext_transcript(session: requests.Session, video_id: str, track: dict[str, str]) -> tuple[str, int | None, dict[str, Any]]:
     params = {"v": video_id, "lang": track.get("lang_code") or "en", "fmt": "srv3"}
     if track.get("kind"):
         params["kind"] = track["kind"]
     if track.get("name"):
         params["name"] = track["name"]
-    resp = session.get("https://www.youtube.com/api/timedtext", params=params, timeout=20)
+    resp, retry_diag = _request_with_backoff(session, "https://www.youtube.com/api/timedtext", params, timeout=20)
+    if resp is None:
+        raise RuntimeError("HTTP unavailable after retries")
     if resp.status_code != 200:
         raise RuntimeError(f"HTTP {resp.status_code}")
     root = ET.fromstring(resp.text or "<transcript/>")
     lines = [html.unescape((n.text or "").strip()) for n in root.findall("text")]
     transcript = "\n".join(x for x in lines if x)
-    return transcript, resp.status_code
+    return transcript, resp.status_code, retry_diag
 
 
 class BrainCreateRequest(BaseModel):
@@ -682,12 +772,50 @@ async def process_run(job: dict[str, Any]) -> None:
     probe_attempt_count = 0
     audio_mode = payload.mode == "audio_first"
     yt_dlp_available = _yt_dlp_exists()
-    run["audio_fallback_unavailable"] = bool(audio_mode and not yt_dlp_available)
+    ffmpeg_available = _ffmpeg_exists()
+    run["audio_fallback_unavailable"] = bool(audio_mode and (not yt_dlp_available or not ffmpeg_available))
+    run["audio_fallback_unavailable_reasons"] = [x for x in ["yt_dlp_missing" if not yt_dlp_available else None, "ffmpeg_missing" if not ffmpeg_available else None] if x]
     total_audio_minutes = 0.0
+    consecutive_429 = 0
     for src in selected_pool:
         if len(caption_eligible) >= requested_new and not audio_mode:
             break
         vid = src.get("video_id", "")
+        cached = _load_caption_probe_cache(root, vid)
+        if cached:
+            attempt = {
+                "run_id": run_id,
+                "brain_slug": brain_id,
+                "video_id": vid,
+                "video_url": src.get("url"),
+                "title": src.get("title"),
+                "phase": "caption_probe",
+                "method": "timedtext_probe",
+                "selected_for_ingest": False,
+                **session_diag,
+                "http_status": cached.get("last_http_status"),
+                "response_len": cached.get("response_len", 0),
+                "error_code": cached.get("error_code"),
+                "error_message": cached.get("error_message"),
+                "caption_tracks_found": cached.get("tracks_found", 0),
+                "tracks_found": cached.get("tracks_found", 0),
+                "probe_status": cached.get("probe_status"),
+                "selected_track": cached.get("selected_track"),
+                "elapsed_ms": 0,
+                "success": cached.get("probe_status") == "captions_available",
+                "transcript_chars": 0,
+                "cache_hit": True,
+            }
+            if attempt["success"]:
+                src["selected_track"] = attempt["selected_track"]
+                caption_eligible.append(src)
+            elif attempt["probe_status"] == "no_captions":
+                no_caption_count += 1
+            else:
+                blocked_probe_count += 1
+            append_jsonl(transcript_attempts_path, attempt)
+            probe_attempt_count += 1
+            continue
         started = time.perf_counter()
         attempt = {
             "run_id": run_id,
@@ -712,7 +840,11 @@ async def process_run(job: dict[str, Any]) -> None:
             "transcript_chars": 0,
         }
         try:
-            tracks, status, probe_status, response_len = _caption_tracks(session, vid)
+            async with CAPTION_PROBE_SEM:
+                tracks, status, probe_status, response_len, retry_diag = _caption_tracks(session, vid)
+                time.sleep(random.uniform(CAPTION_PROBE_DELAY_MIN_MS / 1000, CAPTION_PROBE_DELAY_MAX_MS / 1000))
+            attempt["retry_count"] = retry_diag.get("retry_count", 0)
+            attempt["retries"] = retry_diag.get("retries", [])
             attempt["http_status"] = status
             attempt["response_len"] = response_len
             attempt["caption_tracks_found"] = len(tracks)
@@ -724,23 +856,42 @@ async def process_run(job: dict[str, Any]) -> None:
                 attempt["success"] = True
                 src["selected_track"] = track
                 caption_eligible.append(src)
+                consecutive_429 = 0
             elif probe_status == "no_captions":
                 attempt["error_code"] = "no_captions"
                 attempt["error_message"] = "No caption tracks returned"
                 no_caption_count += 1
+                consecutive_429 = 0
             else:
                 blocked_probe_count += 1
-                attempt["error_code"] = probe_status
+                attempt["error_code"] = "blocked_429" if status == 429 else probe_status
                 attempt["error_message"] = probe_status
+                consecutive_429 = consecutive_429 + 1 if status == 429 else 0
         except Exception as exc:
             blocked_probe_count += 1
             attempt["probe_status"] = "blocked_error"
             attempt["error_code"] = "blocked_error"
             attempt["error_message"] = str(exc)
+        if consecutive_429 >= CAPTION_PROBE_429_COOLDOWN_AFTER:
+            attempt["cooldown_seconds"] = CAPTION_PROBE_429_COOLDOWN_SECONDS
+            time.sleep(CAPTION_PROBE_429_COOLDOWN_SECONDS)
+            session, session_diag = _build_http_session()
+            consecutive_429 = 0
         attempt["elapsed_ms"] = round((time.perf_counter() - started) * 1000, 2)
         append_jsonl(transcript_attempts_path, attempt)
+        _save_caption_probe_cache(root, vid, {
+            "video_id": vid,
+            "probed_at": utc_now(),
+            "tracks_found": attempt.get("tracks_found", 0),
+            "blocked_count": 1 if (attempt.get("probe_status") or "").startswith("blocked") else 0,
+            "last_http_status": attempt.get("http_status"),
+            "probe_status": attempt.get("probe_status"),
+            "selected_track": attempt.get("selected_track"),
+            "response_len": attempt.get("response_len", 0),
+            "error_code": attempt.get("error_code"),
+            "error_message": attempt.get("error_message"),
+        })
         probe_attempt_count += 1
-
     selected = caption_eligible[:requested_new]
     if audio_mode and len(selected) < requested_new:
         selected_ids = {x.get("video_id") for x in selected}
@@ -808,8 +959,10 @@ async def process_run(job: dict[str, Any]) -> None:
                         "transcript_chars": 0,
                     }
                     try:
-                        transcript, status = _fetch_timedtext_transcript(session, vid, track)
+                        transcript, status, retry_diag = _fetch_timedtext_transcript(session, vid, track)
                         attempt["http_status"] = status
+                        attempt["retry_count"] = retry_diag.get("retry_count", 0)
+                        attempt["retries"] = retry_diag.get("retries", [])
                         if transcript.strip():
                             attempt["success"] = True
                             attempt["transcript_chars"] = len(transcript)
@@ -824,8 +977,10 @@ async def process_run(job: dict[str, Any]) -> None:
                         attempt["error_message"] = msg
                         if "429" in msg:
                             attempt["error_code"] = "blocked_429"
+                            attempt["http_status"] = 429
                         elif "403" in msg:
                             attempt["error_code"] = "blocked_403"
+                            attempt["http_status"] = 403
                         else:
                             attempt["error_code"] = "timedtext_error"
                     attempt["elapsed_ms"] = round((time.perf_counter() - started) * 1000, 2)
@@ -838,14 +993,19 @@ async def process_run(job: dict[str, Any]) -> None:
 
                 if not transcript_ok and audio_mode:
                     if not yt_dlp_available:
-                        raise RuntimeError("audio_fallback_unavailable: yt-dlp missing")
+                        raise RuntimeError("audio_fallback_unavailable: yt_dlp_missing")
+                    if not ffmpeg_available:
+                        raise RuntimeError("audio_fallback_unavailable: ffmpeg_missing")
                     async with DOWNLOAD_SEM:
-                        audio_path = tmp_dir / f"yt_{vid}.audio.m4a"
+                        audio_path = run_dir(root, run_id) / "audio" / f"{vid}.%(ext)s"
                         downloaded, dl_diag = _download_audio_with_diagnostics(src.get("url"), audio_path)
                         dl_diag.update({"run_id": run_id, "video_id": vid, "selected_for_ingest": True})
                         append_jsonl(transcript_attempts_path, dl_diag)
                         if not downloaded:
-                            raise RuntimeError("audio_download_failed")
+                            reason = "audio_download_blocked" if "429" in (dl_diag.get("stderr_tail") or "") else "audio_download_failed"
+                            dl_diag["error_code"] = reason
+                            append_jsonl(transcript_attempts_path, {"run_id": run_id, "video_id": vid, "phase": "transcription", "method": "audio_transcribe", "selected_for_ingest": True, "success": False, "error_code": reason, "error_message": dl_diag.get("stderr_tail"), "stderr_tail": dl_diag.get("stderr_tail")})
+                            raise RuntimeError(reason)
                     async with STT_SEM:
                         run["stage"] = "extracting"
                         run["current"] = {"video_id": vid, "stage": "extracting", "detail": "Transcribing audio"}
@@ -870,6 +1030,7 @@ async def process_run(job: dict[str, Any]) -> None:
                             "success": bool(transcript.strip()),
                             "transcript_chars": len(transcript),
                             "audio_minutes": round(audio_seconds / 60.0, 3),
+                            "duration_seconds": audio_seconds,
                         })
                         diag["stt"] = stt_diag
                 elif not transcript_ok:
@@ -923,7 +1084,7 @@ async def process_run(job: dict[str, Any]) -> None:
 
     run["completed_at"] = utc_now()
     run["errors"] = errors
-    run["total_audio_minutes"] = round(total_audio_minutes, 3) if total_audio_minutes > 0 else None
+    run["total_audio_minutes"] = round(total_audio_minutes, 3) if total_audio_minutes > 0 else 0.0
     run["ingested_video_ids"] = ingested_ids
     run["brain_pack"] = pack_info
     attempts = load_transcript_attempts(root, run_id)
@@ -934,7 +1095,8 @@ async def process_run(job: dict[str, Any]) -> None:
     probe_attempts = [x for x in attempts if x.get("phase") == "caption_probe"]
     blocked_probe = sum(1 for x in probe_attempts if x.get("probe_status") in {"blocked", "blocked_empty", "blocked_error"})
     no_caption_probe = sum(1 for x in probe_attempts if x.get("probe_status") == "no_captions")
-    is_blocked = any((x.get("error_code") in blocked_codes) for x in selected_attempts) or (len(probe_attempts) > 0 and blocked_probe >= max(1, len(probe_attempts) // 2))
+    proxy_confirmed = bool((attempts[0].get("proxy_enabled") if attempts else False))
+    is_blocked = proxy_confirmed and (any((x.get("error_code") in blocked_codes) for x in selected_attempts) or (len(probe_attempts) > 0 and blocked_probe >= max(1, len(probe_attempts) // 2)))
     if transcripts_succeeded >= 1 and errors:
         run["status"] = "partial_success"
     elif transcripts_succeeded >= 1:
@@ -981,7 +1143,7 @@ async def startup() -> None:
 
 @app.get("/v1/health")
 def health() -> dict[str, Any]:
-    return {"status": "ok", "time": utc_now()}
+    return {"status": "ok", "time": utc_now(), "yt_dlp_available": _yt_dlp_exists(), "ffmpeg_available": _ffmpeg_exists()}
 
 
 @app.get("/v1/brains")
