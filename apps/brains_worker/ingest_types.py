@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional
+from typing import Literal
 
 
 @dataclass
@@ -36,6 +37,39 @@ class DocCandidate:
     url: Optional[str] = None
     domain: Optional[str] = None
     provider: Optional[str] = None
+
+
+@dataclass
+class WebdocCandidate:
+    url: str
+    title: Optional[str] = None
+    snippet: Optional[str] = None
+    provider: Literal["ddg", "serpapi"] = "ddg"
+    rank: int = 0
+
+
+@dataclass
+class WebdocDiscoveryDiagnostics:
+    provider_used: str
+    parse_status: str
+    http_status: int | str | None = None
+    elapsed_ms: int | None = None
+    error_code: str | None = None
+    error_message: str | None = None
+    result_count_raw: int | None = None
+    result_count_usable: int | None = None
+
+
+@dataclass
+class WebdocIngestDiagnostics:
+    url: str
+    http_status: int | str | None = None
+    content_type: str | None = None
+    elapsed_ms: int | None = None
+    extract_status: str = "error"
+    extracted_chars: int = 0
+    error_code: str | None = None
+    error_message: str | None = None
 
 
 @dataclass

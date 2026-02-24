@@ -55,6 +55,7 @@ class RunStatus:
     webdocs_failure_reasons: dict[str, int] = field(default_factory=dict)
     webdocs_discovery_provider_used: str | None = None
     webdocs_fallback_reason: str | None = None
+    webdocs_discovery_diagnostics: dict[str, Any] = field(default_factory=dict)
     updated_at: str = field(default_factory=utc_now)
 
     def to_dict(self) -> dict[str, Any]:
@@ -93,6 +94,7 @@ class RunStatus:
             "webdocs_failure_reasons": self.webdocs_failure_reasons,
             "webdocs_discovery_provider_used": self.webdocs_discovery_provider_used,
             "webdocs_fallback_reason": self.webdocs_fallback_reason,
+            "webdocs_discovery_diagnostics": self.webdocs_discovery_diagnostics,
             "updated_at": self.updated_at,
         }
 

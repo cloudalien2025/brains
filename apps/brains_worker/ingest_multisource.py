@@ -36,6 +36,8 @@ def ensure_run_dirs(run_dir: Path) -> None:
         "docs/html",
         "docs/text",
         "docs/meta",
+        "webdocs/text",
+        "webdocs/meta",
     ]:
         (run_dir / folder).mkdir(parents=True, exist_ok=True)
 
@@ -187,6 +189,9 @@ def run_ingest_multisource(run_ctx: RunContext) -> RunStatus:
 
     requested_youtube = int(run_ctx.config.get("youtube_requested_new", 1))
     requested_webdocs = int(run_ctx.config.get("webdoc_requested_new", 3))
+    max_webdocs_ingest = int(os.getenv("WEBDOCS_MAX_INGEST", "10"))
+    if requested_webdocs > max_webdocs_ingest:
+        requested_webdocs = max_webdocs_ingest
     max_candidates_youtube = int(run_ctx.config.get("youtube_max_candidates", 50))
     max_candidates_webdocs = int(run_ctx.config.get("webdoc_max_candidates", 50))
 
@@ -213,7 +218,7 @@ def run_ingest_multisource(run_ctx: RunContext) -> RunStatus:
         writer.update(status="failed", step="completed", stage_detail=str(exc))
         return status
 
-    webdocs_candidates, provider_used, fallback_reason = discover_webdocs(
+    webdocs_candidates, webdocs_diagnostics = discover_webdocs(
         run_ctx.keyword,
         max_candidates_webdocs,
         {
@@ -228,8 +233,9 @@ def run_ingest_multisource(run_ctx: RunContext) -> RunStatus:
         candidates_found_total=len(candidates_youtube) + len(webdocs_candidates),
         candidates_found_youtube=len(candidates_youtube),
         candidates_found_webdocs=len(webdocs_candidates),
-        webdocs_discovery_provider_used=provider_used,
-        webdocs_fallback_reason=fallback_reason,
+        webdocs_discovery_provider_used=webdocs_diagnostics.get("webdocs_discovery_provider_used"),
+        webdocs_fallback_reason=webdocs_diagnostics.get("webdocs_fallback_reason"),
+        webdocs_discovery_diagnostics=webdocs_diagnostics,
     )
 
     ledger_path = run_ctx.brain_root / "ledger.json"

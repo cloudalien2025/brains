@@ -504,13 +504,18 @@ if run_id:
             c8.metric("items_failed_webdocs", int(run_data.get("items_failed_webdocs") or 0))
             c9.metric("selected_new_webdocs", int(run_data.get("selected_new_webdocs") or 0))
 
+            provider_used = run_data.get("webdocs_discovery_provider_used") or "n/a"
+            fallback_reason = run_data.get("webdocs_fallback_reason") or "n/a"
             st.write({
-                "webdocs_discovery_provider_used": run_data.get("webdocs_discovery_provider_used"),
-                "webdocs_fallback_reason": run_data.get("webdocs_fallback_reason"),
+                "webdocs_discovery_provider_used": provider_used,
+                "webdocs_fallback_reason": fallback_reason,
             })
 
             with st.expander("Webdocs failure reasons"):
                 st.json(run_data.get("webdocs_failure_reasons") or {})
+
+            with st.expander("Webdocs diagnostics"):
+                st.json(run_data.get("webdocs_discovery_diagnostics") or {})
 
             current = run_data.get("current") or {}
             if isinstance(current, dict) and current:

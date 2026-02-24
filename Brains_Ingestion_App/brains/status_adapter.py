@@ -27,6 +27,7 @@ def normalize_run_status(payload: dict[str, Any] | None) -> dict[str, Any]:
     data["transcripts_failed"] = _coalesce_int(data.get("transcripts_failed"), data.get("items_failed_youtube"))
     data["total_audio_minutes"] = _coalesce_float(data.get("total_audio_minutes"), 0.0)
     data.setdefault("webdocs_failure_reasons", {})
+    data.setdefault("webdocs_discovery_diagnostics", {})
     return data
 
 
