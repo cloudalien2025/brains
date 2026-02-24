@@ -8,7 +8,7 @@ import requests
 import streamlit as st
 from streamlit.errors import StreamlitSecretNotFoundError
 
-from brains.status_adapter import (
+from Brains_Ingestion_App.brains.status_adapter import (
     normalize_run_status,
     normalize_report,
     normalize_run_for_display,
