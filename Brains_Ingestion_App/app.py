@@ -8,14 +8,22 @@ import requests
 import streamlit as st
 from streamlit.errors import StreamlitSecretNotFoundError
 
-from Brains_Ingestion_App.brains.status_adapter import (
-    normalize_run_status,
-    normalize_report,
-    normalize_run_for_display,
-    report_counters,
-    report_not_ready,
-)
-
+try:
+    from brains.status_adapter import (
+        normalize_run_status,
+        normalize_report,
+        normalize_run_for_display,
+        report_counters,
+        report_not_ready,
+    )
+except ModuleNotFoundError:
+    from Brains_Ingestion_App.brains.status_adapter import (
+        normalize_run_status,
+        normalize_report,
+        normalize_run_for_display,
+        report_counters,
+        report_not_ready,
+    )
 
 TERMINAL_RUN_STATES = {"completed", "completed_with_errors", "failed", "success", "partial_success", "no_captions", "blocked"}
 WORKER_DEFAULT_TIMEOUT = 90
