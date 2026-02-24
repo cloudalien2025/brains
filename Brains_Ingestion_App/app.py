@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import os
 import time
+from pathlib import Path
 from typing import Any
 
 import requests
 import streamlit as st
 from streamlit.errors import StreamlitSecretNotFoundError
+
+from brains.status_adapter import normalize_run_status, normalize_report, normalize_run_for_display
 
 
 TERMINAL_RUN_STATES = {"completed", "completed_with_errors", "failed", "success", "partial_success", "no_captions", "blocked"}
@@ -22,6 +26,106 @@ def _secret(name: str) -> str:
 
 def _snippet(text: str, limit: int = 500) -> str:
     return (text or "")[:limit]
+
+
+def _format_duration(seconds: Any) -> str:
+    try:
+        value = int(seconds)
+    except (TypeError, ValueError):
+        return ""
+    if value <= 0:
+        return ""
+    mins = value // 60
+    secs = value % 60
+    return f"{mins}:{secs:02d}"
+
+
+def _brain_runs_root(brain_slug: str) -> Path:
+    base = Path(os.getenv("BRAINS_DATA_DIR", "/opt/brains-data"))
+    return base / "brains" / brain_slug / "runs"
+
+
+def compute_brain_fill(brain_slug: str) -> dict[str, Any]:
+    capacity = int(os.getenv("BRAIN_CAPACITY_ITEMS", "500"))
+    runs_root = _brain_runs_root(brain_slug)
+    if not runs_root.exists():
+        return {
+            "youtube_count": 0,
+            "webdocs_count": 0,
+            "total": 0,
+            "capacity": capacity,
+            "fill_pct": 0.0,
+        }
+
+    yt_ids = set()
+    for path in runs_root.glob("*/transcripts/*.txt"):
+        name = path.stem
+        if name.startswith("yt_"):
+            name = name[3:]
+        if name:
+            yt_ids.add(name)
+
+    doc_ids = set()
+    for path in runs_root.glob("*/docs/text/*.txt"):
+        name = path.stem
+        if name:
+            doc_ids.add(name)
+
+    total = len(yt_ids) + len(doc_ids)
+    fill_pct = min(total / capacity, 1.0) if capacity > 0 else 0.0
+    return {
+        "youtube_count": len(yt_ids),
+        "webdocs_count": len(doc_ids),
+        "total": total,
+        "capacity": capacity,
+        "fill_pct": fill_pct,
+    }
+
+
+def render_brain_fill(fill: dict[str, Any]) -> None:
+    pct = float(fill.get("fill_pct") or 0.0) * 100.0
+    pct_display = f"{pct:.1f}%"
+    total = int(fill.get("total") or 0)
+    capacity = int(fill.get("capacity") or 0)
+    yt = int(fill.get("youtube_count") or 0)
+    docs = int(fill.get("webdocs_count") or 0)
+
+    st.markdown(
+        f"""
+        <div style="display:flex; gap:24px; align-items:flex-end;">
+          <div style="
+            width:140px;
+            height:260px;
+            border:2px solid #28323a;
+            border-radius:70px;
+            background:linear-gradient(180deg, #f2f5f7 0%, #e7ecef 100%);
+            position:relative;
+            overflow:hidden;">
+            <div style="
+              position:absolute;
+              bottom:0;
+              left:0;
+              width:100%;
+              height:{pct:.3f}%;
+              background:linear-gradient(180deg, #32c26b 0%, #1f8a52 100%);
+              transition:height 0.6s ease;">
+            </div>
+            <div style="
+              position:absolute;
+              inset:0;
+              box-shadow:inset 0 0 18px rgba(0,0,0,0.12);">
+            </div>
+          </div>
+          <div style="min-width:220px;">
+            <div style="font-size:20px; font-weight:600;">{total} items ingested</div>
+            <div style="color:#4b5964; margin-top:4px;">{total} / {capacity} capacity ({pct_display})</div>
+            <div style="margin-top:12px; color:#4b5964;">YouTube: {yt}</div>
+            <div style="color:#4b5964;">WebDocs: {docs}</div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def _render_worker_http_error(response: requests.Response) -> None:
@@ -51,6 +155,7 @@ for key, default in {
     "run_id": None,
     "last_report": None,
     "last_error": None,
+    "last_run_data": None,
     "brain_pack_id": None,
 }.items():
     st.session_state.setdefault(key, default)
@@ -63,6 +168,20 @@ def worker_request(method: str, path: str, json: dict[str, Any] | None = None, p
     url = worker_url.rstrip("/") + path
     headers = {"X-Api-Key": worker_api_key}
     return requests.request(method, url, headers=headers, json=json, params=params, timeout=WORKER_DEFAULT_TIMEOUT)
+
+
+def fetch_run_files(run_id: str) -> dict[str, Any] | None:
+    try:
+        response = worker_request("GET", f"/v1/runs/{run_id}/files")
+        if response.ok:
+            payload = response.json()
+            return payload if isinstance(payload, dict) else None
+        if response.status_code in {404, 202}:
+            return None
+        _render_worker_http_error(response)
+        return None
+    except requests.RequestException:
+        return None
 
 
 def poll_run_status_with_retry(run_id: str, retries: int = 2) -> tuple[dict[str, Any] | None, str | None]:
@@ -153,6 +272,14 @@ else:
 
 if worker_healthy:
     fetch_brains()
+
+st.subheader("Brain Fill Level")
+selected_brain_id_for_fill = st.session_state.get("selected_brain_id")
+if selected_brain_id_for_fill:
+    fill = compute_brain_fill(str(selected_brain_id_for_fill))
+    render_brain_fill(fill)
+else:
+    st.info("Select a Brain to see the fill level.")
 
 st.subheader("Brain")
 brains = st.session_state.get("brains", [])
@@ -274,6 +401,8 @@ if run_id:
         st.warning(f"Run status fetch failed temporarily; retrying. Details: {run_error}")
 
     if run_data:
+        run_data = normalize_run_status(run_data)
+        st.session_state["last_run_data"] = run_data
         status = str(run_data.get("status", "unknown"))
         selected_new = int(run_data.get("selected_new") or 0)
         completed = int(run_data.get("completed") or 0)
@@ -292,16 +421,6 @@ if run_id:
         progress_total = selected_new if selected_new > 0 else 1
         st.progress(min(completed / progress_total, 1.0))
 
-        current = run_data.get("current") or {}
-        if isinstance(current, dict) and current:
-            st.write(
-                {
-                    "current.source_id": current.get("source_id"),
-                    "current.stage": current.get("stage"),
-                    "current.detail": current.get("detail"),
-                }
-            )
-
         if status in TERMINAL_RUN_STATES:
             try:
                 report_response = worker_request("GET", f"/v1/runs/{run_id}/report")
@@ -313,12 +432,161 @@ if run_id:
                     _render_worker_http_error(report_response)
             except requests.RequestException as exc:
                 st.error(f"Failed to fetch report: {exc}")
-        elif polling_enabled:
+
+        files_json = fetch_run_files(run_id)
+        run_display_payload = dict(run_data)
+        report_snapshot = st.session_state.get("last_report")
+        if isinstance(report_snapshot, dict):
+            run_display_payload["report"] = report_snapshot
+        display = normalize_run_for_display(run_display_payload, files_json)
+
+        summary_tab, selected_tab, raw_tab = st.tabs(["Summary", "Selected & Ingested", "Raw JSON"])
+
+        with summary_tab:
+            st.subheader("Counters")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("candidates_found_youtube", int(run_data.get("candidates_found_youtube") or 0))
+            c2.metric("candidates_found_webdocs", int(run_data.get("candidates_found_webdocs") or 0))
+            c3.metric("items_succeeded_total", int(run_data.get("items_succeeded_total") or 0))
+
+            c4, c5, c6 = st.columns(3)
+            c4.metric("items_succeeded_youtube", int(run_data.get("items_succeeded_youtube") or 0))
+            c5.metric("items_succeeded_webdocs", int(run_data.get("items_succeeded_webdocs") or 0))
+            c6.metric("items_failed_total", int(run_data.get("items_failed_total") or 0))
+
+            c7, c8, c9 = st.columns(3)
+            c7.metric("items_failed_youtube", int(run_data.get("items_failed_youtube") or 0))
+            c8.metric("items_failed_webdocs", int(run_data.get("items_failed_webdocs") or 0))
+            c9.metric("selected_new_webdocs", int(run_data.get("selected_new_webdocs") or 0))
+
+            st.write({
+                "webdocs_discovery_provider_used": run_data.get("webdocs_discovery_provider_used"),
+                "webdocs_fallback_reason": run_data.get("webdocs_fallback_reason"),
+            })
+
+            with st.expander("Webdocs failure reasons"):
+                st.json(run_data.get("webdocs_failure_reasons") or {})
+
+            current = run_data.get("current") or {}
+            if isinstance(current, dict) and current:
+                st.write(
+                    {
+                        "current.source_id": current.get("source_id"),
+                        "current.stage": current.get("stage"),
+                        "current.detail": current.get("detail"),
+                    }
+                )
+
+        with selected_tab:
+            st.subheader("YouTube (Selected)")
+            selected_youtube_rows = []
+            for item in display.get("selected_youtube", []):
+                selected_youtube_rows.append(
+                    {
+                        "video_id": item.get("video_id"),
+                        "title": item.get("title"),
+                        "uploader": item.get("uploader"),
+                        "duration": _format_duration(item.get("duration_s")),
+                        "url": item.get("url"),
+                    }
+                )
+            if selected_youtube_rows:
+                st.dataframe(selected_youtube_rows, use_container_width=True)
+            else:
+                st.info("No selected YouTube items available yet.")
+
+            st.subheader("WebDocs (Selected)")
+            selected_webdocs_rows = []
+            for item in display.get("selected_webdocs", []):
+                selected_webdocs_rows.append(
+                    {
+                        "doc_id": item.get("doc_id"),
+                        "title": item.get("title"),
+                        "domain": item.get("domain"),
+                        "provider": item.get("provider"),
+                        "url": item.get("url"),
+                    }
+                )
+            if selected_webdocs_rows:
+                st.dataframe(selected_webdocs_rows, use_container_width=True)
+            else:
+                st.info("No selected WebDocs available yet.")
+
+            st.subheader("Succeeded")
+            yt_success = display.get("succeeded_youtube", [])
+            doc_success = display.get("succeeded_webdocs", [])
+            st.write(
+                {
+                    "youtube_succeeded": len(yt_success),
+                    "webdocs_succeeded": len(doc_success),
+                }
+            )
+
+            yt_success_rows = [
+                {
+                    "video_id": item.get("video_id"),
+                    "transcript": "✅" if item.get("transcript_exists") else "—",
+                    "artifact_path": item.get("artifact_path") or "",
+                }
+                for item in yt_success
+            ]
+            if yt_success_rows:
+                st.dataframe(yt_success_rows, use_container_width=True)
+            else:
+                st.info("No succeeded YouTube items yet.")
+
+            doc_success_rows = [
+                {
+                    "doc_id": item.get("doc_id"),
+                    "text": "✅" if item.get("text_exists") else "—",
+                    "artifact_path": item.get("artifact_path") or "",
+                }
+                for item in doc_success
+            ]
+            if doc_success_rows:
+                st.dataframe(doc_success_rows, use_container_width=True)
+            else:
+                st.info("No succeeded WebDocs yet.")
+
+            st.subheader("Failed")
+            failures = []
+            for item in display.get("failed_youtube", []):
+                failures.append(
+                    {
+                        "type": "youtube",
+                        "item_id": item.get("video_id"),
+                        "stage": item.get("stage"),
+                        "error_code": item.get("error_code"),
+                        "error_message": item.get("error_message"),
+                    }
+                )
+            for item in display.get("failed_webdocs", []):
+                failures.append(
+                    {
+                        "type": "webdocs",
+                        "item_id": item.get("doc_id"),
+                        "stage": item.get("stage"),
+                        "error_code": item.get("error_code"),
+                        "error_message": item.get("error_message"),
+                    }
+                )
+            if failures:
+                st.dataframe(failures, use_container_width=True)
+            else:
+                st.info("No failed items recorded yet.")
+
+        with raw_tab:
+            with st.expander("Raw run JSON"):
+                st.json(run_data)
+
+        if status not in TERMINAL_RUN_STATES and polling_enabled:
             time.sleep(1.5)
             st.rerun()
 
 report = st.session_state.get("last_report")
 if report:
+    run_data = st.session_state.get("last_run_data")
+    report = normalize_report(report, run_data)
     st.subheader("Run Report")
     st.write(
         {
@@ -328,6 +596,9 @@ if report:
             "total_audio_minutes": report.get("total_audio_minutes"),
         }
     )
+
+    with st.expander("Raw report JSON"):
+        st.json(report)
 
     existing_pack_id = report.get("brain_pack_id")
     if existing_pack_id:
