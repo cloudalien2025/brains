@@ -128,6 +128,8 @@ def render_brain_fill(fill: dict[str, Any]) -> None:
     )
     if not fill.get("available"):
         st.info("Stats unavailable")
+    else:
+        st.caption("TEST_HOOK:STATS_OK")
 
 
 def _render_worker_http_error(response: requests.Response) -> None:
@@ -150,6 +152,7 @@ st.set_page_config(page_title="Brains ingestion", layout="wide")
 st.title("Brains ingestion")
 st.caption("Select a Brain, ingest new videos by keyword, generate a Brain Pack.")
 st.caption("Discovery powered by YouTube Data API (server-side).")
+st.caption("TEST_HOOK:APP_LOADED")
 
 for key, default in {
     "brains": [],
