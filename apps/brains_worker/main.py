@@ -29,6 +29,7 @@ import requests
 
 from apps.brains_worker.ingest_multisource import run_ingest_multisource
 from apps.brains_worker.ingest_types import RunContext
+from apps.brains_worker.brain_stats import compute_brain_stats
 from apps.brains_worker.webdocs_discovery import is_serpapi_configured
 from apps.brains_worker.status import RunStatus, StatusWriter
 from apps.brains_worker.transcribe import transcribe_audio, TranscriptionError, TranscriptionTimeout
@@ -1857,6 +1858,7 @@ def health() -> dict[str, Any]:
             "webdocs_primary_provider": webdocs_primary_provider,
             "webdocs_secondary_provider": webdocs_secondary_provider,
             "webdocs_fallback_enabled": bool(serpapi_configured and webdocs_secondary_provider == "serpapi"),
+            "brain_stats_endpoint": True,
         }
     except Exception:
         return {"status": "ok", "time": utc_now(), "db": "unknown", "spaces": "unknown"}
@@ -1893,6 +1895,12 @@ def get_brain(brain_id: str, x_api_key: str | None = Header(default=None, alias=
     if not brain:
         raise HTTPException(status_code=404, detail="Brain not found")
     return brain
+
+
+@app.get("/v1/brains/{brain_slug}/stats")
+def brain_stats(brain_slug: str, x_api_key: str | None = Header(default=None, alias="X-Api-Key")) -> dict[str, Any]:
+    require_api_key(x_api_key)
+    return compute_brain_stats(brain_slug)
 
 
 @app.post("/v1/brains/{brain_id}/ingest", status_code=202)

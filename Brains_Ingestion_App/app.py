@@ -2,14 +2,19 @@ from __future__ import annotations
 
 import os
 import time
-from pathlib import Path
 from typing import Any
 
 import requests
 import streamlit as st
 from streamlit.errors import StreamlitSecretNotFoundError
 
-from brains.status_adapter import normalize_run_status, normalize_report, normalize_run_for_display
+from brains.status_adapter import (
+    normalize_run_status,
+    normalize_report,
+    normalize_run_for_display,
+    report_counters,
+    report_not_ready,
+)
 
 
 TERMINAL_RUN_STATES = {"completed", "completed_with_errors", "failed", "success", "partial_success", "no_captions", "blocked"}
@@ -40,55 +45,50 @@ def _format_duration(seconds: Any) -> str:
     return f"{mins}:{secs:02d}"
 
 
-def _brain_runs_root(brain_slug: str) -> Path:
-    base = Path(os.getenv("BRAINS_DATA_DIR", "/opt/brains-data"))
-    return base / "brains" / brain_slug / "runs"
-
-
 def compute_brain_fill(brain_slug: str) -> dict[str, Any]:
-    capacity = int(os.getenv("BRAIN_CAPACITY_ITEMS", "500"))
-    runs_root = _brain_runs_root(brain_slug)
-    if not runs_root.exists():
-        return {
-            "youtube_count": 0,
-            "webdocs_count": 0,
-            "total": 0,
-            "capacity": capacity,
-            "fill_pct": 0.0,
-        }
+    capacity_fallback = int(os.getenv("BRAIN_CAPACITY_ITEMS", "500"))
+    fallback = {
+        "brain_slug": brain_slug,
+        "capacity_items": capacity_fallback,
+        "total_items": 0,
+        "youtube_items": 0,
+        "webdocs_items": 0,
+        "fill_pct": 0.0,
+        "available": False,
+    }
+    if not worker_url or not worker_api_key:
+        return fallback
+    try:
+        response = worker_request("GET", f"/v1/brains/{brain_slug}/stats")
+        if not response.ok:
+            return fallback
+        payload = response.json()
+        if not isinstance(payload, dict):
+            return fallback
+    except requests.RequestException:
+        return fallback
 
-    yt_ids = set()
-    for path in runs_root.glob("*/transcripts/*.txt"):
-        name = path.stem
-        if name.startswith("yt_"):
-            name = name[3:]
-        if name:
-            yt_ids.add(name)
+    fill_pct = float(payload.get("fill_pct") or 0.0)
+    fill_pct = max(0.0, min(fill_pct, 1.0))
 
-    doc_ids = set()
-    for path in runs_root.glob("*/docs/text/*.txt"):
-        name = path.stem
-        if name:
-            doc_ids.add(name)
-
-    total = len(yt_ids) + len(doc_ids)
-    fill_pct = min(total / capacity, 1.0) if capacity > 0 else 0.0
     return {
-        "youtube_count": len(yt_ids),
-        "webdocs_count": len(doc_ids),
-        "total": total,
-        "capacity": capacity,
+        "brain_slug": brain_slug,
+        "capacity_items": int(payload.get("capacity_items") or capacity_fallback),
+        "total_items": int(payload.get("total_items") or 0),
+        "youtube_items": int(payload.get("youtube_items") or 0),
+        "webdocs_items": int(payload.get("webdocs_items") or 0),
         "fill_pct": fill_pct,
+        "available": True,
     }
 
 
 def render_brain_fill(fill: dict[str, Any]) -> None:
     pct = float(fill.get("fill_pct") or 0.0) * 100.0
     pct_display = f"{pct:.1f}%"
-    total = int(fill.get("total") or 0)
-    capacity = int(fill.get("capacity") or 0)
-    yt = int(fill.get("youtube_count") or 0)
-    docs = int(fill.get("webdocs_count") or 0)
+    total = int(fill.get("total_items") or 0)
+    capacity = int(fill.get("capacity_items") or 0)
+    yt = int(fill.get("youtube_items") or 0)
+    docs = int(fill.get("webdocs_items") or 0)
 
     st.markdown(
         f"""
@@ -126,6 +126,8 @@ def render_brain_fill(fill: dict[str, Any]) -> None:
         """,
         unsafe_allow_html=True,
     )
+    if not fill.get("available"):
+        st.info("Stats unavailable")
 
 
 def _render_worker_http_error(response: requests.Response) -> None:
@@ -168,6 +170,46 @@ def worker_request(method: str, path: str, json: dict[str, Any] | None = None, p
     url = worker_url.rstrip("/") + path
     headers = {"X-Api-Key": worker_api_key}
     return requests.request(method, url, headers=headers, json=json, params=params, timeout=WORKER_DEFAULT_TIMEOUT)
+
+
+def _auto_refresh_report(run_id: str, placeholder: st.delta_generator.DeltaGenerator, interval_s: float = 2.0, max_wait_s: float = 30.0) -> None:
+    report_snapshot = st.session_state.get("last_report")
+    if isinstance(report_snapshot, dict) and not report_not_ready(report_snapshot):
+        return
+
+    state = st.session_state.get("report_poll_state") or {}
+    if state.get("run_id") != run_id:
+        state = {"run_id": run_id, "started_at": time.time(), "timed_out": False}
+
+    elapsed = time.time() - float(state.get("started_at") or time.time())
+    if elapsed >= max_wait_s:
+        state["timed_out"] = True
+        st.session_state["report_poll_state"] = state
+        placeholder.info("Report not ready yet—check back in a moment.")
+        return
+
+    try:
+        response = worker_request("GET", f"/v1/runs/{run_id}/report")
+        if response.ok:
+            payload = response.json() if response.text else {}
+            st.session_state["last_report"] = payload
+            if report_not_ready(payload):
+                placeholder.info("Report still building… refreshing")
+                st.session_state["report_poll_state"] = state
+                time.sleep(interval_s)
+                st.rerun()
+            else:
+                placeholder.empty()
+            return
+        if response.status_code == 202:
+            placeholder.info("Report still building… refreshing")
+            st.session_state["report_poll_state"] = state
+            time.sleep(interval_s)
+            st.rerun()
+            return
+        _render_worker_http_error(response)
+    except requests.RequestException as exc:
+        st.error(f"Failed to fetch report: {exc}")
 
 
 def fetch_run_files(run_id: str) -> dict[str, Any] | None:
@@ -422,16 +464,8 @@ if run_id:
         st.progress(min(completed / progress_total, 1.0))
 
         if status in TERMINAL_RUN_STATES:
-            try:
-                report_response = worker_request("GET", f"/v1/runs/{run_id}/report")
-                if report_response.ok:
-                    st.session_state["last_report"] = report_response.json()
-                elif report_response.status_code == 202:
-                    st.info("Run finished; report is still being generated.")
-                else:
-                    _render_worker_http_error(report_response)
-            except requests.RequestException as exc:
-                st.error(f"Failed to fetch report: {exc}")
+            report_placeholder = st.empty()
+            _auto_refresh_report(run_id, report_placeholder)
 
         files_json = fetch_run_files(run_id)
         run_display_payload = dict(run_data)
@@ -583,28 +617,37 @@ if run_id:
             time.sleep(1.5)
             st.rerun()
 
-report = st.session_state.get("last_report")
-if report:
-    run_data = st.session_state.get("last_run_data")
-    report = normalize_report(report, run_data)
+if run_id:
     st.subheader("Run Report")
+    report_snapshot = st.session_state.get("last_report")
+    run_data = st.session_state.get("last_run_data")
+
+    report_ready = isinstance(report_snapshot, dict) and not report_not_ready(report_snapshot)
+    report_payload = normalize_report(report_snapshot, run_data) if report_ready else {}
+    counters = report_counters(report_payload if report_ready else None, run_data)
+
+    report_state = st.session_state.get("report_poll_state") or {}
+    if report_not_ready(report_snapshot):
+        st.info("Report still building… refreshing")
+    elif report_state.get("timed_out"):
+        st.info("Report not ready yet—check back in a moment.")
+
     st.write(
         {
-            "ingested_new": report.get("ingested_new"),
-            "transcripts_succeeded": report.get("transcripts_succeeded"),
-            "transcripts_failed": report.get("transcripts_failed"),
-            "total_audio_minutes": report.get("total_audio_minutes"),
+            "items_succeeded_total": counters.get("items_succeeded_total"),
+            "items_failed_total": counters.get("items_failed_total"),
+            "total_audio_minutes": counters.get("total_audio_minutes"),
         }
     )
 
     with st.expander("Raw report JSON"):
-        st.json(report)
+        st.json(report_snapshot or {})
 
-    existing_pack_id = report.get("brain_pack_id")
+    existing_pack_id = report_payload.get("brain_pack_id") if report_ready else None
     if existing_pack_id:
         download_url = f"{worker_url.rstrip('/')}/v1/brain-packs/{existing_pack_id}/download"
         st.link_button("Download Brain Pack", download_url)
-    else:
+    elif report_ready:
         st.info("No brain_pack_id in report yet.")
         if st.button("Build Brain Pack"):
             run_id_for_pack = st.session_state.get("run_id")

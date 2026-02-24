@@ -42,6 +42,51 @@ def normalize_report(report: dict[str, Any] | None, run_data: dict[str, Any] | N
     return data
 
 
+def report_not_ready(report: dict[str, Any] | None) -> bool:
+    if not isinstance(report, dict):
+        return False
+    detail = report.get("detail")
+    if not isinstance(detail, str):
+        return False
+    return detail.strip().lower() == "report_not_ready"
+
+
+def report_counters(report: dict[str, Any] | None, run_data: dict[str, Any] | None = None) -> dict[str, Any]:
+    report = dict(report or {})
+    run_data = dict(run_data or {})
+
+    items_succeeded_total = _coalesce_int(
+        report.get("items_succeeded_total"),
+        report.get("transcripts_succeeded"),
+    )
+    if items_succeeded_total == 0:
+        items_succeeded_total = _coalesce_int(
+            run_data.get("items_succeeded_total"),
+            run_data.get("transcripts_succeeded"),
+        )
+
+    items_failed_total = _coalesce_int(
+        report.get("items_failed_total"),
+        report.get("transcripts_failed"),
+    )
+    if items_failed_total == 0:
+        items_failed_total = _coalesce_int(
+            run_data.get("items_failed_total"),
+            run_data.get("transcripts_failed"),
+        )
+
+    total_audio_minutes = _coalesce_float(
+        report.get("total_audio_minutes"),
+        run_data.get("total_audio_minutes"),
+    )
+
+    return {
+        "items_succeeded_total": items_succeeded_total,
+        "items_failed_total": items_failed_total,
+        "total_audio_minutes": total_audio_minutes,
+    }
+
+
 def _safe_list(value: Any) -> list[Any]:
     if isinstance(value, list):
         return value
