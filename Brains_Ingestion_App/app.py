@@ -148,7 +148,7 @@ def _render_worker_http_error(response: requests.Response) -> None:
         st.error(
             "Worker is reachable but /v1/health not found. This usually means the droplet is still "
             "running the old worker. Deploy/restart the new Brains Worker v1 service and confirm "
-            "https://worker.aiohut.com/v1/health returns 200."
+            "https://api.ibrains.ai/v1/health returns 200."
         )
     elif status == 401:
         st.error("Invalid worker API key. Check Streamlit secrets worker_api_key.")
@@ -173,8 +173,8 @@ for key, default in {
 }.items():
     st.session_state.setdefault(key, default)
 
-worker_url = _secret("worker_url")
-worker_api_key = _secret("worker_api_key")
+worker_url = _secret("worker_url") or os.getenv("BRAINS_WORKER_URL", "https://api.ibrains.ai")
+worker_api_key = _secret("worker_api_key") or os.getenv("BRAINS_WORKER_API_KEY", "").strip()
 
 
 def worker_request(method: str, path: str, json: dict[str, Any] | None = None, params: dict[str, Any] | None = None) -> requests.Response:
